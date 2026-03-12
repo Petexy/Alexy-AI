@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Larger terminal icon for the widget header -->
+  <rect x="4" y="6" width="40" height="36" rx="5" ry="5"/>
+  <polyline points="14 16 20 22 14 28"/>
+  <line x1="24" y1="28" x2="34" y2="28"/>
+</svg>

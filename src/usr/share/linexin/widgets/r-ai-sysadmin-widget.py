@@ -31,6 +31,8 @@ except Exception:
 CONFIG_DIR = os.path.expanduser("~/.config/linexin-center")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "ai-sysadmin.json")
 CONVERSATIONS_DIR = os.path.join(CONFIG_DIR, "conversations")
+BUNDLED_THEMES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "themes")
+USER_THEMES_DIR = os.path.join(CONFIG_DIR, "themes")
 
 class SudoManager:
     _instance: Optional['SudoManager'] = None
@@ -535,6 +537,12 @@ class LinexinAISysadminWidget(Gtk.Box):
         
         # Security / Safety
         self.auto_execute_commands = True
+
+        # Theme
+        self.theme = "default"
+        self.theme_data: Dict[str, Any] = {}
+        self.theme_dir: Optional[str] = None
+        self._theme_css_provider: Optional[Gtk.CssProvider] = None
         
         self.system_prompt = _(
             "You are Alexy, an expert AI Sysadmin running under Linexin - An Arch Linux based operating system. "
@@ -552,6 +560,7 @@ class LinexinAISysadminWidget(Gtk.Box):
         self._reset_history()
         
         self.load_config()
+        self._load_theme()
         self.setup_ui()
         
         if self.hide_sidebar and self.window:
@@ -569,6 +578,8 @@ class LinexinAISysadminWidget(Gtk.Box):
             if row is None:
                 break
             self.chat_listbox.remove(row)
+        self._last_bubble_role = None
+        self._last_bubble_box = None
 
     def _get_conversations_dir(self):
         os.makedirs(CONVERSATIONS_DIR, exist_ok=True)
@@ -897,6 +908,110 @@ class LinexinAISysadminWidget(Gtk.Box):
                 print(f"Failed to resize window: {e}")
         return False
 
+    def _discover_themes(self) -> List[Dict[str, Any]]:
+        """Scan bundled and user theme directories, return list of theme info dicts."""
+        themes: List[Dict[str, Any]] = []
+        seen_ids: set = set()
+        for themes_root in [BUNDLED_THEMES_DIR, USER_THEMES_DIR]:
+            if not os.path.isdir(themes_root):
+                continue
+            for entry in sorted(os.listdir(themes_root)):
+                theme_path = os.path.join(themes_root, entry)
+                manifest = os.path.join(theme_path, "theme.json")
+                if not os.path.isfile(manifest):
+                    continue
+                try:
+                    with open(manifest, 'r') as f:
+                        data = json.load(f)
+                    theme_id = entry  # folder name is the theme id
+                    if theme_id in seen_ids:
+                        continue  # user themes don't override bundled ones by id
+                    seen_ids.add(theme_id)
+                    themes.append({
+                        "id": theme_id,
+                        "path": theme_path,
+                        "name": data.get("name", theme_id),
+                        "author": data.get("author", _("Unknown")),
+                        "description": data.get("description", ""),
+                        "version": data.get("version", "1.0"),
+                        "css": data.get("css", {})
+                    })
+                except Exception as e:
+                    print(f"Error reading theme {entry}: {e}")
+        return themes
+
+    def _load_theme(self):
+        """Load the currently selected theme's assets and apply CSS overrides."""
+        themes = self._discover_themes()
+        # Find matching theme by id
+        chosen = None
+        for t in themes:
+            if t["id"] == self.theme:
+                chosen = t
+                break
+        if not chosen and themes:
+            chosen = themes[0]  # fallback to first available
+        if not chosen:
+            self.theme_data = {}
+            self.theme_dir = None
+            return
+
+        self.theme_data = chosen
+        self.theme_dir = chosen["path"]
+
+        # Base CSS for the widget (GTK CSS uses margin-left/right, NOT margin-start/end)
+        # Spacing goes on the inner box, NOT the row — so default boxed-list separators align
+        css_text = """
+        box.message-box { margin-top: 10px; margin-bottom: 10px; margin-left: 12px; margin-right: 12px; }
+        """
+
+        # Apply CSS overrides from theme.json (legacy support)
+        css_overrides = chosen.get("css", {})
+        assistant_bg = css_overrides.get("assistant_bubble_bg", "")
+        user_bg = css_overrides.get("user_bubble_bg", "")
+        accent = css_overrides.get("accent_color", "")
+        if assistant_bg:
+            css_text += f"box.assistant-bubble {{ background-color: {assistant_bg}; }}\n"
+        if user_bg:
+            css_text += f"box.user-bubble {{ background-color: {user_bg}; }}\n"
+        if accent:
+            css_text += f"button.suggested-action {{ background-color: {accent}; }}\n"
+
+        # Apply comprehensive custom stylesheet if present
+        if self.theme_dir is not None:
+            style_path = os.path.join(str(self.theme_dir), "style.css")
+            if os.path.isfile(style_path):
+                try:
+                    with open(style_path, "r") as f:
+                        css_text += "\n" + f.read()
+                except Exception as e:
+                    print(f"Error loading theme style.css: {e}")
+
+        from gi.repository import Gdk  # type: ignore
+        display = Gdk.Display.get_default()
+
+        # Remove previously applied theme CSS
+        if self._theme_css_provider and display:
+            Gtk.StyleContext.remove_provider_for_display(display, self._theme_css_provider)
+            self._theme_css_provider = None
+
+        if css_text and display:
+            provider = Gtk.CssProvider()
+            provider.load_from_data(css_text.encode("utf-8"))
+            Gtk.StyleContext.add_provider_for_display(
+                display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1  # type: ignore
+            )
+            self._theme_css_provider = provider
+
+    def _get_theme_svg(self, filename: str) -> Optional[str]:
+        """Return absolute path to a theme SVG file, or None if it doesn't exist."""
+        theme_dir = self.theme_dir
+        if theme_dir is not None:
+            path = os.path.join(theme_dir, filename)
+            if os.path.isfile(path):
+                return path
+        return None
+
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
             try:
@@ -912,6 +1027,7 @@ class LinexinAISysadminWidget(Gtk.Box):
                     self.voice_correction_direct = config.get("voice_correction_direct", False)
                     self.voice_correction_qwen = config.get("voice_correction_qwen", False)
                     self.auto_execute_commands = config.get("auto_execute_commands", True)
+                    self.theme = config.get("theme", "default")
             except Exception as e:
                 print(f"Error loading config: {e}")
 
@@ -929,7 +1045,8 @@ class LinexinAISysadminWidget(Gtk.Box):
                     "vosk_lang": self.vosk_lang,
                     "voice_correction_direct": self.voice_correction_direct,
                     "voice_correction_qwen": self.voice_correction_qwen,
-                    "auto_execute_commands": self.auto_execute_commands
+                    "auto_execute_commands": self.auto_execute_commands,
+                    "theme": self.theme
                 }, f, indent=4)
         except Exception as e:
             print(f"Error saving config: {e}")
@@ -939,8 +1056,13 @@ class LinexinAISysadminWidget(Gtk.Box):
         header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         header_box.set_margin_bottom(20)
         
-        system_icon = Gtk.Image.new_from_icon_name("system-run-symbolic")
+        header_svg = self._get_theme_svg("header-icon.svg")
+        if header_svg:
+            system_icon = Gtk.Image.new_from_file(header_svg)
+        else:
+            system_icon = Gtk.Image.new_from_icon_name("system-run-symbolic")
         system_icon.set_pixel_size(48)
+        self.header_icon_widget = system_icon
         header_box.append(system_icon)
         
         title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -1044,10 +1166,16 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.send_btn.connect("clicked", self.on_send_clicked)
         input_box.append(self.send_btn)
 
-        self.stt_toggle = Gtk.ToggleButton(icon_name="audio-input-microphone-symbolic")
+        self.stt_toggle = Gtk.ToggleButton()
+        self.stt_icon = Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic")
+        self.stt_toggle.set_child(self.stt_icon)
         self.stt_toggle.set_size_request(40, 40)
         self.stt_toggle.set_valign(Gtk.Align.END)
         self.stt_toggle.connect("toggled", self.on_stt_toggled)
+        # Load custom microphone icon from theme if available
+        mic_svg = self._get_theme_svg("microphone-icon.svg")
+        if mic_svg:
+            self.stt_icon.set_from_file(mic_svg)
         try:
             import vosk # type: ignore # pylint: disable=import-error # noqa: F401
         except ImportError:
@@ -1062,6 +1190,22 @@ class LinexinAISysadminWidget(Gtk.Box):
         chat_page.append(input_box)
         self.main_stack.add_named(chat_page, "chat")
         self.main_stack.set_visible_child_name("chat")
+
+        # Setup real-time dark mode class tracking for themes
+        style_manager = Adw.StyleManager.get_default()
+        def _on_dark_changed(*_args):
+            if style_manager.get_dark():
+                self.add_css_class("dark")
+                self.main_stack.add_css_class("dark")
+                if hasattr(self, 'chat_listbox'):
+                    self.chat_listbox.add_css_class("dark")
+            else:
+                self.remove_css_class("dark")
+                self.main_stack.remove_css_class("dark")
+                if hasattr(self, 'chat_listbox'):
+                    self.chat_listbox.remove_css_class("dark")
+        style_manager.connect("notify::dark", _on_dark_changed)
+        _on_dark_changed()  # Apply initial state
 
         self.add_message_bubble("assistant", _("Hello! I am Alexy. How can I help you today?"))
 
@@ -1194,11 +1338,32 @@ class LinexinAISysadminWidget(Gtk.Box):
     def add_message_bubble(self, role, content, is_html=False):
         row = Gtk.ListBoxRow()
         row.set_selectable(False)
+        row.add_css_class("message-row")
+        if role == "user":
+            row.add_css_class("user-message-row")
+        else:
+            row.add_css_class("assistant-message-row")
+            
+        # Handle message grouping for themes (directional tails)
+        if not hasattr(self, '_last_bubble_role'):
+            self._last_bubble_role = None
+            self._last_bubble_box = None
+            
+        if self._last_bubble_role == role and self._last_bubble_box:
+            # Previous message is no longer the last in its group
+            self._last_bubble_box.remove_css_class("last-in-group")
+            
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        box.set_margin_top(10)
-        box.set_margin_bottom(10)
-        box.set_margin_start(12)
-        box.set_margin_end(12)
+        box.add_css_class("message-box")
+        box.add_css_class("last-in-group")
+        
+        self._last_bubble_role = role
+        self._last_bubble_box = box
+        
+        if role == "user":
+            box.add_css_class("user-message-box")
+        else:
+            box.add_css_class("assistant-message-box")
 
         import html
         escaped_content = html.escape(content)
@@ -1229,30 +1394,38 @@ class LinexinAISysadminWidget(Gtk.Box):
         if role == "user":
             box.set_halign(Gtk.Align.END)
             label = Gtk.Label()
+            label.add_css_class("message-label")
             label.set_markup(parsed_markup)
             label.set_wrap(True)
             label.set_selectable(True)
             label.set_xalign(1.0)
             
             bubble = Gtk.Box()
-            bubble.set_margin_start(50)
+            bubble.add_css_class("message-bubble")
+            bubble.add_css_class("user-bubble")
             bubble.append(label)
             box.append(bubble)
         else:
             box.set_halign(Gtk.Align.START)
-            icon = Gtk.Image.new_from_icon_name(self.widgeticon)
+            avatar_svg = self._get_theme_svg("assistant-avatar.svg")
+            if avatar_svg:
+                icon = Gtk.Image.new_from_file(avatar_svg)
+            else:
+                icon = Gtk.Image.new_from_icon_name(self.widgeticon)
             icon.set_pixel_size(24)
             icon.set_valign(Gtk.Align.START)
             box.append(icon)
             
             label = Gtk.Label()
+            label.add_css_class("message-label")
             label.set_markup(parsed_markup)
             label.set_wrap(True)
             label.set_selectable(True)
             label.set_xalign(0.0)
             
             bubble = Gtk.Box()
-            bubble.set_margin_end(50)
+            bubble.add_css_class("message-bubble")
+            bubble.add_css_class("assistant-bubble")
             bubble.append(label)
             box.append(bubble)
 
@@ -1474,14 +1647,80 @@ class LinexinAISysadminWidget(Gtk.Box):
         # Page 3: Theme
         page_theme = Adw.PreferencesPage(title=_("Theme"), icon_name="applications-graphics-symbolic")
         window.add(page_theme)
-        
-        theme_group = Adw.PreferencesGroup()
+
+        theme_group = Adw.PreferencesGroup(title=_("Appearance"), description=_("Select a theme to customize the look of the AI assistant."))
         page_theme.add(theme_group)
-        
-        soon_label = Gtk.Label(label="SOON:", halign=Gtk.Align.CENTER)
-        soon_label.add_css_class("title-1")
-        soon_label.set_margin_top(48)
-        theme_group.add(soon_label)
+
+        available_themes = self._discover_themes()
+        theme_ids = [t["id"] for t in available_themes]
+        theme_names_list = Gtk.StringList()
+        current_theme_idx = 0
+        for i, t in enumerate(available_themes):
+            theme_names_list.append(t["name"])
+            if t["id"] == self.theme:
+                current_theme_idx = i
+
+        theme_row = Adw.ComboRow(title=_("Theme"))
+        theme_row.set_model(theme_names_list)
+        theme_row.set_selected(current_theme_idx)
+        theme_group.add(theme_row)
+
+        # Preview group
+        preview_group = Adw.PreferencesGroup(title=_("Preview"))
+        page_theme.add(preview_group)
+
+        preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        preview_box.set_margin_top(12)
+        preview_box.set_margin_bottom(12)
+        preview_box.set_halign(Gtk.Align.CENTER)
+
+        preview_avatar = Gtk.Image()
+        preview_avatar.set_pixel_size(64)
+        preview_box.append(preview_avatar)
+
+        preview_desc = Gtk.Label()
+        preview_desc.add_css_class("dim-label")
+        preview_desc.set_wrap(True)
+        preview_desc.set_halign(Gtk.Align.CENTER)
+        preview_box.append(preview_desc)
+
+        preview_author = Gtk.Label()
+        preview_author.add_css_class("caption")
+        preview_author.add_css_class("dim-label")
+        preview_author.set_halign(Gtk.Align.CENTER)
+        preview_box.append(preview_author)
+
+        preview_group.add(preview_box)
+
+        def update_theme_preview(idx):
+            if idx < 0 or idx >= len(available_themes):
+                return
+            t = available_themes[idx]
+            avatar_path = os.path.join(t["path"], "assistant-avatar.svg")
+            if os.path.isfile(avatar_path):
+                preview_avatar.set_from_file(avatar_path)
+            else:
+                preview_avatar.set_from_icon_name("applications-graphics-symbolic")
+            preview_desc.set_label(t.get("description", ""))
+            preview_author.set_label(_("by {}").format(t.get("author", _("Unknown"))))
+
+        update_theme_preview(current_theme_idx)
+
+        def on_theme_changed(row, _pspec):
+            update_theme_preview(row.get_selected())
+
+        theme_row.connect("notify::selected", on_theme_changed)
+
+        info_group = Adw.PreferencesGroup()
+        page_theme.add(info_group)
+        info_label = Gtk.Label(
+            label=_("Custom themes can be installed to:\n{}").format(USER_THEMES_DIR),
+            halign=Gtk.Align.CENTER
+        )
+        info_label.add_css_class("dim-label")
+        info_label.add_css_class("caption")
+        info_label.set_wrap(True)
+        info_group.add(info_label)
 
         def on_window_close_request(win):
             idx = backend_row.get_selected()
@@ -1522,7 +1761,28 @@ class LinexinAISysadminWidget(Gtk.Box):
             self.voice_correction_direct = direct_vc_row.get_active()
             self.voice_correction_qwen = qwen_vc_row.get_active()
             self.auto_execute_commands = auto_exec_row.get_active()
-                
+
+            # Apply selected theme
+            selected_theme_idx = theme_row.get_selected()
+            if selected_theme_idx < len(theme_ids):
+                new_theme = theme_ids[selected_theme_idx]
+                if new_theme != self.theme:
+                    self.theme = new_theme
+                    self._load_theme()
+                    # Refresh header icon and stt icon
+                    header_svg = self._get_theme_svg("header-icon.svg")
+                    if header_svg:
+                        self.header_icon_widget.set_from_file(header_svg)
+                    else:
+                        self.header_icon_widget.set_from_icon_name("system-run-symbolic")
+                        
+                    if hasattr(self, 'stt_icon'):
+                        mic_svg = self._get_theme_svg("microphone-icon.svg")
+                        if mic_svg:
+                            self.stt_icon.set_from_file(mic_svg)
+                        else:
+                            self.stt_icon.set_from_icon_name("audio-input-microphone-symbolic")
+
             self.save_config()
             self.update_subtitle()
             return False
@@ -1904,26 +2164,44 @@ class LinexinAISysadminWidget(Gtk.Box):
         row = Gtk.ListBoxRow()
         row.set_selectable(False)
         row._is_thinking_indicator = True
+        row.add_css_class("message-row")
+        row.add_css_class("assistant-message-row")
+        row.add_css_class("thinking-row")
+
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        box.set_margin_top(10)
-        box.set_margin_bottom(10)
-        box.set_margin_start(12)
-        box.set_margin_end(12)
+        box.add_css_class("message-box")
+        box.add_css_class("assistant-message-box")
+        box.add_css_class("last-in-group")
         box.set_halign(Gtk.Align.START)
 
-        icon = Gtk.Image.new_from_icon_name(self.widgeticon)
-        icon.set_pixel_size(24)
-        icon.set_valign(Gtk.Align.START)
-        box.append(icon)
+        # Check for a custom thinking indicator SVG in the theme
+        thinking_svg = self._get_theme_svg("thinking-indicator.svg")
+        if thinking_svg:
+            # Minimalist custom bubble (like iMessage typing indicator)
+            avatar = Gtk.Image.new_from_file(thinking_svg)
+            avatar.set_pixel_size(-1)  # Use natural SVG size (40x16)
 
-        inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        spinner = Gtk.Spinner()
-        spinner.start()
-        inner.append(spinner)
-        label = Gtk.Label(label=_("Thinking..."))
-        label.add_css_class("dim-label")
-        inner.append(label)
-        box.append(inner)
+            bubble = Gtk.Box()
+            bubble.add_css_class("message-bubble")
+            bubble.add_css_class("assistant-bubble")
+            bubble.add_css_class("thinking-bubble")
+            bubble.append(avatar)
+            box.append(bubble)
+        else:
+            # Fallback to standard animated spinner with avatar
+            icon = Gtk.Image.new_from_icon_name(self.widgeticon)
+            icon.set_pixel_size(24)
+            icon.set_valign(Gtk.Align.START)
+            box.append(icon)
+
+            inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            spinner = Gtk.Spinner()
+            spinner.start()
+            inner.append(spinner)
+            label = Gtk.Label(label=_("Thinking..."))
+            label.add_css_class("dim-label")
+            inner.append(label)
+            box.append(inner)
 
         row.set_child(box)
         self.chat_listbox.append(row)
@@ -1938,6 +2216,12 @@ class LinexinAISysadminWidget(Gtk.Box):
 
     def _remove_thinking_indicator(self):
         """Remove the thinking indicator bubble if present."""
+        # This breaks the "last-in-group" chain conceptually since it might be 
+        # visually between two assistant messages. We reset it to ensure the 
+        # actual next reply gets a proper group class.
+        self._last_bubble_role = None
+        self._last_bubble_box = None
+        
         if hasattr(self, '_thinking_row') and self._thinking_row:
             try:
                 self.chat_listbox.remove(self._thinking_row)
