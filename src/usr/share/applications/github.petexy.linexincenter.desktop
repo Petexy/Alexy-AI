@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Linexin Center
+
+Exec=python /usr/bin/linexin-center
+
+Icon=/usr/share/icons/github.petexy.linexincenter.svg
+
+Terminal=false
+Type=Application
+Categories=System;Linexin;Adwaita;Updates;Tools;Utility;
+StartupNotify=false

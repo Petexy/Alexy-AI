@@ -499,7 +499,7 @@ class MultilineEntry(Gtk.ScrolledWindow):
         self.textview.add_controller(key_ctrl)
 
 class LinexinAISysadminWidget(Gtk.Box):
-    def __init__(self, hide_sidebar=False, window=None, sudo_manager=None, **kwargs):
+    def __init__(self, hide_sidebar=False, window=None, sudo_manager=None, voice_autostart=False, **kwargs):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12) # type: ignore
         self.widgetname = "AI Sysadmin"
         self.widgeticon = "utilities-terminal-symbolic"
@@ -528,7 +528,9 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.local_model = "qwen3.5"
         self.local_url = "http://localhost:11434/api/chat"
         
-        # Voice-to-Text (Vosk) Config
+        # Voice-to-Text Config
+        self.stt_backend = "whisper"  # "whisper" or "vosk"
+        self.whisper_model = "small"  # tiny, base, small, medium
         self.vosk_lang = "small-en-us-0.15"
         
         # Per-backend voice correction toggles
@@ -565,6 +567,10 @@ class LinexinAISysadminWidget(Gtk.Box):
         
         if self.hide_sidebar and self.window:
             GLib.idle_add(self.resize_window_deferred)
+
+        # Auto-activate voice input if launched with --voice flag
+        if voice_autostart:
+            GLib.idle_add(self.stt_toggle.set_active, True)
 
     def _reset_history(self):
         self.chat_history = [{"role": "system", "content": self.system_prompt}]
@@ -1023,6 +1029,8 @@ class LinexinAISysadminWidget(Gtk.Box):
                     self.model = config.get("model", self.model)
                     self.local_model = config.get("local_model", self.local_model)
                     self.system_prompt = config.get("system_prompt", self.system_prompt)
+                    self.stt_backend = config.get("stt_backend", "whisper")
+                    self.whisper_model = config.get("whisper_model", "small")
                     self.vosk_lang = config.get("vosk_lang", "small-en-us-0.15")
                     self.voice_correction_direct = config.get("voice_correction_direct", False)
                     self.voice_correction_qwen = config.get("voice_correction_qwen", False)
@@ -1042,6 +1050,8 @@ class LinexinAISysadminWidget(Gtk.Box):
                     "model": self.model,
                     "local_model": self.local_model,
                     "system_prompt": self.system_prompt,
+                    "stt_backend": self.stt_backend,
+                    "whisper_model": self.whisper_model,
                     "vosk_lang": self.vosk_lang,
                     "voice_correction_direct": self.voice_correction_direct,
                     "voice_correction_qwen": self.voice_correction_qwen,
@@ -1176,11 +1186,7 @@ class LinexinAISysadminWidget(Gtk.Box):
         mic_svg = self._get_theme_svg("microphone-icon.svg")
         if mic_svg:
             self.stt_icon.set_from_file(mic_svg)
-        try:
-            import vosk # type: ignore # pylint: disable=import-error # noqa: F401
-        except ImportError:
-            self.stt_toggle.set_sensitive(False)
-            self.stt_toggle.set_tooltip_text(_("python-vosk is not installed. Add it to dependencies."))
+        self._check_stt_availability()
         input_box.append(self.stt_toggle)
 
         self.spinner = Gtk.Spinner()
@@ -1209,6 +1215,25 @@ class LinexinAISysadminWidget(Gtk.Box):
 
         self.add_message_bubble("assistant", _("Hello! I am Alexy. How can I help you today?"))
 
+    def _check_stt_availability(self):
+        """Check if the selected STT backend is available and update mic button state."""
+        if self.stt_backend == "whisper":
+            try:
+                import whisper # type: ignore # pylint: disable=import-error # noqa: F401
+            except ImportError:
+                self.stt_toggle.set_sensitive(False)
+                self.stt_toggle.set_tooltip_text(_("openai-whisper is not installed. Install it via: pip install openai-whisper"))
+                return
+        elif self.stt_backend == "vosk":
+            try:
+                import vosk # type: ignore # pylint: disable=import-error # noqa: F401
+            except ImportError:
+                self.stt_toggle.set_sensitive(False)
+                self.stt_toggle.set_tooltip_text(_("python-vosk is not installed. You can install it from Settings."))
+                return
+        self.stt_toggle.set_sensitive(True)
+        self.stt_toggle.set_tooltip_text("")
+
     def on_stt_toggled(self, btn):
         if btn.get_active():
             # Stop any TTS playback before starting mic
@@ -1218,114 +1243,319 @@ class LinexinAISysadminWidget(Gtk.Box):
             if proc:
                 proc.terminate()
                 self.arecord_proc = None
-            
-            model_path = os.path.expanduser(f"~/.cache/linexin/vosk-model-{self.vosk_lang}")
-            if not os.path.exists(model_path):
-                btn.set_active(False)
-                url = f"https://alphacephei.com/vosk/models/vosk-model-{self.vosk_lang}.zip"
-                cmd_str = f"mkdir -p ~/.cache/linexin && rm -rf /tmp/vmodel && unzip -q -o /tmp/vmodel.zip -d /tmp/vmodel/ && mv /tmp/vmodel/* {model_path} && rm -rf /tmp/vmodel /tmp/vmodel.zip"
-                
-                # Fetch first then extract to ensure curl progress shows correctly
-                full_cmd_str = f"curl -L {url} -o /tmp/vmodel.zip && {cmd_str}"
-                
-                win = _ActionProgressWindow(
-                    parent=self.window if self.window else self.get_root(),
-                    title=_("Downloading Offline Voice Model"),
-                    cmd_string=full_cmd_str,
-                    poll_auth_file=False
-                )
-                
-                def on_download_done(success):
-                    if success:
-                        self.entry.set_text(_("Model downloaded. Click mic to speak."))
-                    else:
-                        self.entry.set_text(_("Failed to download voice model."))
-                win.on_close_callback = on_download_done
-                win.present()
-                return
-            
-            import vosk, subprocess, threading # type: ignore # pylint: disable=import-error
-            vosk.SetLogLevel(-1) # type: ignore
-            try:
-                self.vosk_model = vosk.Model(model_path)
-                self.vosk_recognizer = vosk.KaldiRecognizer(self.vosk_model, 16000)
-            except Exception as e:
-                self.add_message_bubble("assistant", _(f"Error loading voice model: {e}"))
-                btn.set_active(False)
-                return
-                
-            self.entry.set_placeholder_text(_("Listening..."))
-            
-            try:
-                self.arecord_proc = subprocess.Popen(
-                    ["arecord", "-f", "S16_LE", "-c", "1", "-r", "16000", "-q"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL
-                ) # type: ignore
-                self.stt_running = True
-                
-                def listen_loop():
-                    import json, time
-                    last_speech_time = time.time()
-                    last_text = ""
-                    while self.stt_running:
-                        proc = self.arecord_proc
-                        if not isinstance(proc, subprocess.Popen):
-                            break
-                        if proc.poll() is not None:
-                            break
-                            
-                        stdout = proc.stdout
-                        if stdout is None:
-                            break
-                        data = stdout.read(4000) # type: ignore
-                        if len(data) == 0:
-                            break
-                            
-                        current_text = ""
-                        if self.vosk_recognizer.AcceptWaveform(data):
-                            res = json.loads(self.vosk_recognizer.Result()) # type: ignore
-                            if res.get("text"):
-                                current_text = res["text"]
-                        else:
-                            partial_json = json.loads(self.vosk_recognizer.PartialResult()) # type: ignore
-                            current_text = partial_json.get("partial", "")
-                            
-                        if current_text and current_text != last_text:
-                            last_speech_time = time.time() # type: ignore
-                            last_text = current_text
-                            GLib.idle_add(self.entry.set_text, current_text)
-                            
-                        # If the user has spoken at least something, evaluate the 2.0s silence timeout frame-by-frame
-                        if last_text and (time.time() - last_speech_time > 2.0): # type: ignore
-                            self._last_input_was_voice = True
-                            GLib.idle_add(self.stt_toggle.set_active, False)
-                            GLib.idle_add(self.send_btn.emit, "clicked")
-                            break
-                    
-                    if hasattr(self, "vosk_recognizer"):
-                        try:
-                            final_json = json.loads(self.vosk_recognizer.FinalResult()) # type: ignore
-                            final_text = final_json.get("text", "")
-                            if final_text:
-                                GLib.idle_add(self.entry.set_text, final_text)
-                        except Exception:
-                            pass
-                    GLib.idle_add(self.entry.set_placeholder_text, _("Ask a question..."))
-                    
-                self.stt_thread = threading.Thread(target=listen_loop, daemon=True)
-                self.stt_thread.start()
-                
-            except Exception as e:
-                self.add_message_bubble("assistant", _(f"Failed to start mic: {e}"))
-                btn.set_active(False)
-                
+
+            if self.stt_backend == "whisper":
+                self._stt_start_whisper(btn)
+            else:
+                self._stt_start_vosk(btn)
         else:
             self.stt_running = False
             proc = self.arecord_proc
             if proc:
                 proc.terminate() # type: ignore
                 self.arecord_proc = None
+
+    def _stt_start_whisper(self, btn):
+        """Start Whisper-based speech-to-text: record audio, then transcribe on silence."""
+        import struct, wave
+        try:
+            import whisper as whisper_module # type: ignore # pylint: disable=import-error
+        except ImportError:
+            self.add_message_bubble("assistant", _("openai-whisper is not installed."))
+            btn.set_active(False)
+            return
+
+        # Check if the Whisper model needs to be downloaded first
+        whisper_cache = os.path.expanduser("~/.cache/whisper")
+        model_file = os.path.join(whisper_cache, f"{self.whisper_model}.pt")
+        if not os.path.exists(model_file):
+            # Model not yet downloaded — download via curl with visible progress
+            btn.set_active(False)
+
+            # Whisper model download URLs
+            whisper_urls = {
+                "tiny": "https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt",
+                "base": "https://openaipublic.azureedge.net/main/whisper/models/ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e/base.pt",
+                "small": "https://openaipublic.azureedge.net/main/whisper/models/9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794/small.pt",
+                "medium": "https://openaipublic.azureedge.net/main/whisper/models/345ae4da62f9b3d59415adc60127b97c714f32e89e936602e85993674d08dcb1/medium.pt",
+            }
+            url = whisper_urls.get(self.whisper_model)
+            if not url:
+                self.add_message_bubble("assistant", _(f"Unknown Whisper model: {self.whisper_model}"))
+                return
+
+            model_sizes = {"tiny": "~39 MB", "base": "~74 MB", "small": "~461 MB", "medium": "~1.5 GB"}
+            size_label = model_sizes.get(self.whisper_model, "")
+
+            # Create a temp download script that outputs clean progress lines
+            dl_script = os.path.join(tempfile.gettempdir(), "linexin_whisper_dl.py")
+            with open(dl_script, "w") as sf:
+                sf.write(
+                    "import urllib.request, sys\n"
+                    f"url = '{url}'\n"
+                    f"out = '{model_file}'\n"
+                    "def progress(block, block_size, total):\n"
+                    "    if total > 0:\n"
+                    "        pct = min(int(block * block_size * 100 / total), 100)\n"
+                    "        done_mb = block * block_size / 1048576\n"
+                    "        total_mb = total / 1048576\n"
+                    "        print(f'{pct}% {done_mb:.0f}MB/{total_mb:.0f}MB', flush=True)\n"
+                    "urllib.request.urlretrieve(url, out, progress)\n"
+                    "print('100%', flush=True)\n"
+                )
+
+            download_cmd = f"mkdir -p {whisper_cache} && python3 {dl_script}"
+            win = _ActionProgressWindow(
+                parent=self.window if self.window else self.get_root(),
+                title=_("Downloading Voice Recognition Model"),
+                cmd_string=download_cmd,
+                is_ollama=True,  # enables percentage-based progress bar parsing
+                initial_status=_("Downloading Whisper {} model ({})...").format(self.whisper_model, size_label),
+                poll_auth_file=False
+            )
+            def on_whisper_download_done(success):
+                if success:
+                    # Auto-activate mic after successful download
+                    GLib.idle_add(btn.set_active, True)
+                else:
+                    self.entry.set_text(_("Failed to download Whisper model."))
+                    # Clean up partial download
+                    try:
+                        if os.path.exists(model_file):
+                            os.unlink(model_file)
+                    except Exception:
+                        pass
+            win.on_close_callback = on_whisper_download_done
+            win.present()
+            return
+
+        # Load or reuse the Whisper model
+        if not hasattr(self, '_whisper_model_obj') or getattr(self, '_whisper_model_name', None) != self.whisper_model:
+            try:
+                self.entry.set_placeholder_text(_("Loading Whisper model..."))
+                self._whisper_model_obj = whisper_module.load_model(self.whisper_model)
+                self._whisper_model_name = self.whisper_model
+            except Exception as e:
+                self.add_message_bubble("assistant", _(f"Error loading Whisper model: {e}"))
+                btn.set_active(False)
+                return
+
+        self.entry.set_placeholder_text(_("Listening..."))
+
+        try:
+            self.arecord_proc = subprocess.Popen(
+                ["arecord", "-f", "S16_LE", "-c", "1", "-r", "16000", "-q"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            ) # type: ignore
+            self.stt_running = True
+
+            def whisper_listen_loop():
+                import time as time_mod
+                SAMPLE_RATE = 16000
+                CHUNK_SIZE = 4000  # ~0.125s of audio at 16kHz mono 16-bit
+                SILENCE_THRESHOLD = 500  # RMS amplitude threshold for silence detection
+                SILENCE_TIMEOUT = 2.0  # seconds of silence before auto-send
+
+                audio_frames: list[bytes] = []
+                last_speech_time: float = time_mod.time()  # type: ignore
+                has_speech = False
+
+                while self.stt_running:
+                    proc = self.arecord_proc
+                    if not isinstance(proc, subprocess.Popen):
+                        break
+                    if proc.poll() is not None:
+                        break
+
+                    stdout = proc.stdout
+                    if stdout is None:
+                        break
+                    data = stdout.read(CHUNK_SIZE) # type: ignore
+                    if len(data) == 0:
+                        break
+
+                    audio_frames.append(data)
+
+                    # Simple RMS-based voice activity detection
+                    try:
+                        samples = struct.unpack(f"<{len(data)//2}h", data)
+                        rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
+                    except Exception:
+                        rms = 0
+
+                    if rms > SILENCE_THRESHOLD:
+                        last_speech_time = time_mod.time()  # type: ignore
+                        if not has_speech:
+                            has_speech = True
+                            GLib.idle_add(self.entry.set_placeholder_text, _("Listening... (speak now)"))
+
+                    # If speech was detected and silence timeout reached, transcribe
+                    if has_speech and (time_mod.time() - last_speech_time > SILENCE_TIMEOUT):  # type: ignore
+                        break
+
+                # Stop recording
+                proc = self.arecord_proc
+                if proc:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    self.arecord_proc = None
+
+                if not has_speech or not audio_frames:
+                    GLib.idle_add(self.entry.set_placeholder_text, _("Ask a question..."))
+                    GLib.idle_add(self.stt_toggle.set_active, False)
+                    return
+
+                # Write collected audio to a temporary WAV file
+                GLib.idle_add(self.entry.set_placeholder_text, _("Transcribing..."))
+                tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, prefix="linexin-stt-")
+                tmp_wav_path = tmp_wav.name
+                try:
+                    with wave.open(tmp_wav_path, 'wb') as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)  # 16-bit = 2 bytes
+                        wf.setframerate(SAMPLE_RATE)
+                        raw_audio: bytes = b''.join(audio_frames)
+                        wf.writeframes(raw_audio)
+
+                    # Transcribe with Whisper
+                    result = self._whisper_model_obj.transcribe(
+                        tmp_wav_path,
+                        fp16=False
+                    )
+                    text = result.get("text", "").strip() # type: ignore
+                finally:
+                    try:
+                        os.unlink(tmp_wav_path)
+                    except Exception:
+                        pass
+
+                if text:
+                    self._last_input_was_voice = True
+                    GLib.idle_add(self.entry.set_text, text)
+                    GLib.idle_add(self.stt_toggle.set_active, False)
+                    GLib.idle_add(self.send_btn.emit, "clicked")
+                else:
+                    GLib.idle_add(self.entry.set_placeholder_text, _("Ask a question..."))
+                    GLib.idle_add(self.stt_toggle.set_active, False)
+
+            self.stt_thread = threading.Thread(target=whisper_listen_loop, daemon=True)
+            self.stt_thread.start()
+
+        except Exception as e:
+            self.add_message_bubble("assistant", _(f"Failed to start mic: {e}"))
+            btn.set_active(False)
+
+    def _stt_start_vosk(self, btn):
+        """Start Vosk-based speech-to-text (streaming recognition)."""
+        model_path = os.path.expanduser(f"~/.cache/linexin/vosk-model-{self.vosk_lang}")
+        if not os.path.exists(model_path):
+            btn.set_active(False)
+            url = f"https://alphacephei.com/vosk/models/vosk-model-{self.vosk_lang}.zip"
+            cmd_str = f"mkdir -p ~/.cache/linexin && rm -rf /tmp/vmodel && unzip -q -o /tmp/vmodel.zip -d /tmp/vmodel/ && mv /tmp/vmodel/* {model_path} && rm -rf /tmp/vmodel /tmp/vmodel.zip"
+
+            # Fetch first then extract to ensure curl progress shows correctly
+            full_cmd_str = f"curl -L {url} -o /tmp/vmodel.zip && {cmd_str}"
+
+            win = _ActionProgressWindow(
+                parent=self.window if self.window else self.get_root(),
+                title=_("Downloading Offline Voice Model"),
+                cmd_string=full_cmd_str,
+                poll_auth_file=False
+            )
+
+            def on_download_done(success):
+                if success:
+                    self.entry.set_text(_("Model downloaded. Click mic to speak."))
+                else:
+                    self.entry.set_text(_("Failed to download voice model."))
+            win.on_close_callback = on_download_done
+            win.present()
+            return
+
+        try:
+            import vosk # type: ignore # pylint: disable=import-error
+        except ImportError:
+            self.add_message_bubble("assistant", _("python-vosk is not installed. You can install it from Settings."))
+            btn.set_active(False)
+            return
+
+        vosk.SetLogLevel(-1) # type: ignore
+        try:
+            self.vosk_model = vosk.Model(model_path)
+            self.vosk_recognizer = vosk.KaldiRecognizer(self.vosk_model, 16000)
+        except Exception as e:
+            self.add_message_bubble("assistant", _(f"Error loading voice model: {e}"))
+            btn.set_active(False)
+            return
+
+        self.entry.set_placeholder_text(_("Listening..."))
+
+        try:
+            self.arecord_proc = subprocess.Popen(
+                ["arecord", "-f", "S16_LE", "-c", "1", "-r", "16000", "-q"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            ) # type: ignore
+            self.stt_running = True
+
+            def listen_loop():
+                import json, time
+                last_speech_time = time.time()
+                last_text = ""
+                while self.stt_running:
+                    proc = self.arecord_proc
+                    if not isinstance(proc, subprocess.Popen):
+                        break
+                    if proc.poll() is not None:
+                        break
+
+                    stdout = proc.stdout
+                    if stdout is None:
+                        break
+                    data = stdout.read(4000) # type: ignore
+                    if len(data) == 0:
+                        break
+
+                    current_text = ""
+                    if self.vosk_recognizer.AcceptWaveform(data):
+                        res = json.loads(self.vosk_recognizer.Result()) # type: ignore
+                        if res.get("text"):
+                            current_text = res["text"]
+                    else:
+                        partial_json = json.loads(self.vosk_recognizer.PartialResult()) # type: ignore
+                        current_text = partial_json.get("partial", "")
+
+                    if current_text and current_text != last_text:
+                        last_speech_time = time.time() # type: ignore
+                        last_text = current_text
+                        GLib.idle_add(self.entry.set_text, current_text)
+
+                    # If the user has spoken at least something, evaluate the 2.0s silence timeout frame-by-frame
+                    if last_text and (time.time() - last_speech_time > 2.0): # type: ignore
+                        self._last_input_was_voice = True
+                        GLib.idle_add(self.stt_toggle.set_active, False)
+                        GLib.idle_add(self.send_btn.emit, "clicked")
+                        break
+
+                if hasattr(self, "vosk_recognizer"):
+                    try:
+                        final_json = json.loads(self.vosk_recognizer.FinalResult()) # type: ignore
+                        final_text = final_json.get("text", "")
+                        if final_text:
+                            GLib.idle_add(self.entry.set_text, final_text)
+                    except Exception:
+                        pass
+                GLib.idle_add(self.entry.set_placeholder_text, _("Ask a question..."))
+
+            self.stt_thread = threading.Thread(target=listen_loop, daemon=True)
+            self.stt_thread.start()
+
+        except Exception as e:
+            self.add_message_bubble("assistant", _(f"Failed to start mic: {e}"))
+            btn.set_active(False)
 
     def update_subtitle(self):
         if self.backend == "direct":
@@ -1598,10 +1828,103 @@ class LinexinAISysadminWidget(Gtk.Box):
         page_speech = Adw.PreferencesPage(title=_("Speech & Audio"), icon_name="audio-speakers-symbolic")
         window.add(page_speech)
         
-        voice_pref_group = Adw.PreferencesGroup(title=_("Voice-to-Text Setup"))
-        page_speech.add(voice_pref_group)
-        
-        voice_lang_row = Adw.ComboRow(title=_("Offline Language Model"))
+        # --- STT Backend Selector ---
+        stt_engine_group = Adw.PreferencesGroup(title=_("Voice-to-Text Engine"))
+        page_speech.add(stt_engine_group)
+
+        stt_backend_row = Adw.ComboRow(title=_("STT Backend"))
+        stt_backends_list = Gtk.StringList()
+        stt_backends_list.append(_("OpenAI Whisper (Recommended)"))
+        vosk_label = _("Vosk (Lightweight)")
+        try:
+            import vosk # type: ignore # pylint: disable=import-error # noqa: F401
+        except ImportError:
+            vosk_label = _("Vosk (Not Installed)")
+        stt_backends_list.append(vosk_label)
+        stt_backend_row.set_model(stt_backends_list)
+        stt_backend_row.set_selected(0 if self.stt_backend == "whisper" else 1)
+        stt_engine_group.add(stt_backend_row)
+
+        # --- Whisper options group ---
+        whisper_group = Adw.PreferencesGroup(title=_("Whisper Settings"), description=_("OpenAI Whisper provides high-accuracy offline transcription. Model is auto-downloaded on first use."))
+        page_speech.add(whisper_group)
+
+        whisper_model_row = Adw.ComboRow(title=_("Model Size"))
+        whisper_model_list = Gtk.StringList()
+        self._whisper_model_options = ["tiny", "base", "small", "medium"]
+        whisper_model_labels = [
+            _("Tiny (~39 MB, fastest)"),
+            _("Base (~74 MB)"),
+            _("Small (~461 MB, recommended)"),
+            _("Medium (~1.5 GB, most accurate)")
+        ]
+        whisper_model_selected = 2  # default: small
+        for i, label in enumerate(whisper_model_labels):
+            whisper_model_list.append(label)
+            if self._whisper_model_options[i] == self.whisper_model:
+                whisper_model_selected = i
+        whisper_model_row.set_model(whisper_model_list)
+        whisper_model_row.set_selected(whisper_model_selected)
+        whisper_group.add(whisper_model_row)
+
+        # --- Vosk options group ---
+        vosk_group = Adw.PreferencesGroup(title=_("Vosk Settings"), description=_("Vosk provides lightweight, streaming offline transcription."))
+        page_speech.add(vosk_group)
+
+        # Install button if vosk is not available
+        vosk_available = True
+        try:
+            import vosk # type: ignore # pylint: disable=import-error # noqa: F401
+        except ImportError:
+            vosk_available = False
+
+        if not vosk_available:
+            vosk_install_row = Adw.ActionRow(title=_("Vosk is not installed"), subtitle=_("Install python-vosk to use the Vosk backend."))
+            vosk_install_btn = Gtk.Button(label=_("Install python-vosk"), valign=Gtk.Align.CENTER)
+            vosk_install_btn.add_css_class("suggested-action")
+            def on_vosk_install_clicked(btn):
+                def do_install():
+                    win_install = _ActionProgressWindow(
+                        parent=window,
+                        title=_("Installing python-vosk"),
+                        cmd_string="pacman -Sy python-vosk --noconfirm",
+                        poll_auth_file=False,
+                        sudo_manager=self.sudo_manager
+                    )
+                    def on_install_done(success):
+                        if success:
+                            vosk_install_row.set_title(_("Vosk installed successfully!"))
+                            vosk_install_row.set_subtitle(_("Vosk backend is now available."))
+                            
+                            # Update the STT backend dropdown dynamically
+                            new_list = Gtk.StringList()
+                            new_list.append(_("OpenAI Whisper (Recommended)"))
+                            new_list.append(_("Vosk (Lightweight)"))
+                            stt_backend_row.set_model(new_list)
+                            
+                            try:
+                                self._check_stt_availability()
+                            except Exception:
+                                pass
+                                
+                            vosk_install_btn.set_sensitive(False)
+                    win_install.on_close_callback = on_install_done
+                    win_install.present()
+
+                manager = self.sudo_manager
+                if not manager or not manager.user_password:
+                    self._prompt_for_password_dialog(
+                        do_install,
+                        _("Please enter your password to install python-vosk.")
+                    )
+                else:
+                    do_install()
+            vosk_install_btn.connect("clicked", on_vosk_install_clicked)
+            vosk_install_row.add_suffix(vosk_install_btn)
+            vosk_install_row.set_activatable_widget(vosk_install_btn)
+            vosk_group.add(vosk_install_row)
+
+        voice_lang_row = Adw.ComboRow(title=_("Vosk Language Model"))
         
         self.vosk_available_langs = [
             ("small-en-us-0.15", _("English (United States)")),
@@ -1628,7 +1951,16 @@ class LinexinAISysadminWidget(Gtk.Box):
                 
         voice_lang_row.set_model(voice_langs)
         voice_lang_row.set_selected(selected_idx)
-        voice_pref_group.add(voice_lang_row)
+        vosk_group.add(voice_lang_row)
+
+        # Toggle visibility based on STT backend selection
+        def sync_stt_visibility(*_args):
+            is_whisper = stt_backend_row.get_selected() == 0
+            whisper_group.set_visible(is_whisper)
+            vosk_group.set_visible(not is_whisper)
+
+        stt_backend_row.connect("notify::selected", sync_stt_visibility)
+        sync_stt_visibility()  # apply initial state
 
         vc_group = Adw.PreferencesGroup(
             title=_("Voice Correction"), 
@@ -1757,6 +2089,15 @@ class LinexinAISysadminWidget(Gtk.Box):
             voice_idx = voice_lang_row.get_selected()
             if voice_idx != Gtk.INVALID_LIST_POSITION and voice_idx < len(self.vosk_available_langs):
                 self.vosk_lang = self.vosk_available_langs[voice_idx][0]
+
+            # Save STT backend settings
+            self.stt_backend = "whisper" if stt_backend_row.get_selected() == 0 else "vosk"
+            whisper_m_idx = whisper_model_row.get_selected()
+            if whisper_m_idx < len(self._whisper_model_options):
+                self.whisper_model = self._whisper_model_options[whisper_m_idx]
+
+
+            self._check_stt_availability()
                 
             self.voice_correction_direct = direct_vc_row.get_active()
             self.voice_correction_qwen = qwen_vc_row.get_active()
@@ -2615,24 +2956,54 @@ class LinexinAISysadminWidget(Gtk.Box):
             if on_ready:
                 GLib.idle_add(on_ready)
             return
+
+        # Simple fast heuristic language detection
+        def detect_lang(txt):
+            txt_lower = txt.lower()
+            if re.search(r'[\u4e00-\u9fff]', txt): return 'zh'
+            if re.search(r'[\u3040-\u30ff]', txt): return 'ja'
+            if re.search(r'[\uac00-\ud7af]', txt): return 'ko'
+            if re.search(r'[\u0400-\u04FF]', txt):
+                if re.search(r'[іїєґ]', txt_lower): return 'uk'
+                return 'ru'
+            words = set(re.findall(r'\b\w+\b', txt_lower))
+            langs = {
+                'pl': {'jest', 'nie', 'to', 'że', 'w', 'z', 'i', 'na', 'do', 'tak', 'dla', 'o', 'ale', 'jak'},
+                'fr': {'le', 'la', 'les', 'un', 'une', 'et', 'à', 'est', 'en', 'pour', 'dans'},
+                'de': {'der', 'die', 'das', 'und', 'ist', 'in', 'den', 'von', 'zu', 'für', 'mit'},
+                'es': {'el', 'la', 'los', 'las', 'un', 'una', 'y', 'en', 'es', 'por', 'con'},
+                'pt': {'o', 'a', 'os', 'as', 'um', 'uma', 'e', 'em', 'é', 'por', 'com'},
+                'it': {'il', 'la', 'i', 'le', 'un', 'una', 'e', 'in', 'è', 'per', 'con'},
+                'en': {'the', 'be', 'to', 'of', 'and', 'a', 'in', 'that', 'have', 'i', 'it'}
+            }
+            best_lang = "en"
+            max_matches = 0
+            for l, stop_words in langs.items():
+                matches = len(words.intersection(stop_words))
+                if matches > max_matches:
+                    max_matches = matches
+                    best_lang = l
+            return best_lang
+
+        detected_lang = detect_lang(clean_text)
         
-        lang_map = {
-            "small-en-us-0.15": ("en_US-libritts_r-medium", "en/en_US/libritts_r/medium"),
-            "small-en-in-0.4": ("en_GB-alba-medium", "en/en_GB/alba/medium"),
-            "small-cn-0.22": ("zh_CN-huayan-medium", "zh/zh_CN/huayan/medium"),
-            "small-fr-0.22": ("fr_FR-siwis-low", "fr/fr_FR/siwis/low"),
-            "small-de-0.15": ("de_DE-thorsten-medium", "de/de_DE/thorsten/medium"),
-            "small-es-0.42": ("es_ES-sharvard-medium", "es/es_ES/sharvard/medium"),
-            "small-pt-0.3": ("pt_PT-tugao-medium", "pt/pt_PT/tugao/medium"),
-            "small-it-0.22": ("it_IT-riccardo-x_low", "it/it_IT/riccardo/x_low"),
-            "small-ru-0.22": ("ru_RU-denis-medium", "ru/ru_RU/denis/medium"),
-            "small-uk-v3-nano": ("uk_UA-ukromir-medium", "uk/uk_UA/ukromir/medium"),
-            "small-pl-0.22": ("pl_PL-gosia-medium", "pl/pl_PL/gosia/medium"),
-            "small-ja-0.22": ("ESPEAK", "ja"),
-            "small-ko-0.22": ("ESPEAK", "ko")
+        piper_models = {
+            "en": ("en_US-libritts_r-medium", "en/en_US/libritts_r/medium"),
+            "zh": ("zh_CN-huayan-medium", "zh/zh_CN/huayan/medium"),
+            "fr": ("fr_FR-siwis-low", "fr/fr_FR/siwis/low"),
+            "de": ("de_DE-thorsten-medium", "de/de_DE/thorsten/medium"),
+            "es": ("es_ES-sharvard-medium", "es/es_ES/sharvard/medium"),
+            "pt": ("pt_PT-tugao-medium", "pt/pt_PT/tugao/medium"),
+            "it": ("it_IT-riccardo-x_low", "it/it_IT/riccardo/x_low"),
+            "ru": ("ru_RU-denis-medium", "ru/ru_RU/denis/medium"),
+            "uk": ("uk_UA-ukromir-medium", "uk/uk_UA/ukromir/medium"),
+            "pl": ("pl_PL-gosia-medium", "pl/pl_PL/gosia/medium"),
+            "ja": ("ESPEAK", "ja"),
+            "ko": ("ESPEAK", "ko")
         }
+        
         fallback = ("en_US-libritts_r-medium", "en/en_US/libritts_r/medium")
-        model_name, model_path = lang_map.get(self.vosk_lang, fallback)
+        model_name, model_path = piper_models.get(detected_lang, fallback)
         
         # Fast-track unsupported AI languages to espeak-ng natively
         if model_name == "ESPEAK":
