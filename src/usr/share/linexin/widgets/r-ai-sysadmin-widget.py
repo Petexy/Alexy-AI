@@ -11,6 +11,7 @@ import locale
 import uuid
 import tempfile
 import atexit
+import base64
 from typing import Optional, Any, List, Dict
 
 gi.require_version("Gtk", "4.0") # type: ignore
@@ -530,8 +531,9 @@ class LinexinAISysadminWidget(Gtk.Box):
         
         # Voice-to-Text Config
         self.stt_backend = "whisper"  # "whisper" or "vosk"
-        self.whisper_model = "small"  # tiny, base, small, medium
+        self.whisper_model = "base"  # tiny, base, small, medium
         self.vosk_lang = "small-en-us-0.15"
+        self.hey_linux_enabled = False
         
         # Per-backend voice correction toggles
         self.voice_correction_direct = False
@@ -595,7 +597,10 @@ class LinexinAISysadminWidget(Gtk.Box):
         """Extract the first user message as a conversation title."""
         for msg in chat_history:
             if msg["role"] == "user":
-                title = msg["content"].strip().replace("\n", " ")
+                text = self._extract_text_from_content(msg["content"])
+                title = text.strip().replace("\n", " ")
+                if not title:
+                    title = _("Image")
                 return title[:50] + ("..." if len(title) > 50 else "")
         return _("New Conversation")
 
@@ -660,7 +665,8 @@ class LinexinAISysadminWidget(Gtk.Box):
         for msg in self.chat_history:
             if msg["role"] == "user":
                 # Skip internal command execution results injected by _run_autonomous_commands
-                if msg["content"].startswith("System Command Execution Results:"):
+                text = self._extract_text_from_content(msg["content"])
+                if text.startswith("System Command Execution Results:"):
                     continue
                 self.add_message_bubble("user", msg["content"])
             elif msg["role"] == "assistant":
@@ -1030,8 +1036,9 @@ class LinexinAISysadminWidget(Gtk.Box):
                     self.local_model = config.get("local_model", self.local_model)
                     self.system_prompt = config.get("system_prompt", self.system_prompt)
                     self.stt_backend = config.get("stt_backend", "whisper")
-                    self.whisper_model = config.get("whisper_model", "small")
+                    self.whisper_model = config.get("whisper_model", "base")
                     self.vosk_lang = config.get("vosk_lang", "small-en-us-0.15")
+                    self.hey_linux_enabled = config.get("hey_linux_enabled", False)
                     self.voice_correction_direct = config.get("voice_correction_direct", False)
                     self.voice_correction_qwen = config.get("voice_correction_qwen", False)
                     self.auto_execute_commands = config.get("auto_execute_commands", True)
@@ -1053,6 +1060,7 @@ class LinexinAISysadminWidget(Gtk.Box):
                     "stt_backend": self.stt_backend,
                     "whisper_model": self.whisper_model,
                     "vosk_lang": self.vosk_lang,
+                    "hey_linux_enabled": self.hey_linux_enabled,
                     "voice_correction_direct": self.voice_correction_direct,
                     "voice_correction_qwen": self.voice_correction_qwen,
                     "auto_execute_commands": self.auto_execute_commands,
@@ -1159,6 +1167,14 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.scrolled_window.set_vexpand(True)
         chat_page.append(self.scrolled_window)
 
+        # Image Preview Strip (shown when images are attached)
+        self.pending_images = []  # list of (mime_type, base64_data) tuples
+        self.image_preview_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.image_preview_box.set_margin_top(6)
+        self.image_preview_box.set_margin_start(4)
+        self.image_preview_box.set_visible(False)
+        chat_page.append(self.image_preview_box)
+
         # Input Area
         input_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         input_box.set_margin_top(12)
@@ -1168,6 +1184,32 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.entry.set_hexpand(True)
         self.entry.connect_activate(self.on_send_clicked)
         input_box.append(self.entry)
+
+        # Image paste handler (Ctrl+V)
+        paste_ctrl = Gtk.EventControllerKey.new()
+        paste_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        def _on_paste_key(ctrl, keyval, keycode, state):
+            from gi.repository import Gdk  # type: ignore
+            if keyval == Gdk.KEY_v and (state & Gdk.ModifierType.CONTROL_MASK):
+                clipboard = self.entry.textview.get_clipboard()
+                formats = clipboard.get_formats()
+                for mime in ["image/png", "image/jpeg", "image/bmp", "image/gif", "image/tiff"]:
+                    if formats.contain_mime_type(mime):
+                        clipboard.read_texture_async(None, self._on_clipboard_texture_ready)
+                        return True
+            return False
+        paste_ctrl.connect("key-pressed", _on_paste_key)
+        self.entry.textview.add_controller(paste_ctrl)
+
+        # Drag & Drop handlers for images
+        from gi.repository import Gdk  # type: ignore
+        drop_target_file = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop_target_file.connect("drop", self._on_file_list_drop)
+        self.entry.add_controller(drop_target_file)
+
+        drop_target_texture = Gtk.DropTarget.new(Gdk.Texture, Gdk.DragAction.COPY)
+        drop_target_texture.connect("drop", self._on_texture_drop)
+        self.entry.add_controller(drop_target_texture)
 
         self.send_btn = Gtk.Button(icon_name="mail-send-symbolic")
         self.send_btn.add_css_class("suggested-action")
@@ -1393,7 +1435,6 @@ class LinexinAISysadminWidget(Gtk.Box):
                     # If speech was detected and silence timeout reached, transcribe
                     if has_speech and (time_mod.time() - last_speech_time > SILENCE_TIMEOUT):  # type: ignore
                         break
-
                 # Stop recording
                 proc = self.arecord_proc
                 if proc:
@@ -1402,6 +1443,11 @@ class LinexinAISysadminWidget(Gtk.Box):
                     except Exception:
                         pass
                     self.arecord_proc = None
+
+                # If the loop exited because the user toggled the button off manually, discard everything
+                if not self.stt_running:
+                    GLib.idle_add(self.entry.set_placeholder_text, _("Ask a question..."))
+                    return
 
                 if not has_speech or not audio_frames:
                     GLib.idle_add(self.entry.set_placeholder_text, _("Ask a question..."))
@@ -1447,6 +1493,47 @@ class LinexinAISysadminWidget(Gtk.Box):
         except Exception as e:
             self.add_message_bubble("assistant", _(f"Failed to start mic: {e}"))
             btn.set_active(False)
+
+    def _on_hey_linux_toggled(self, row, param):
+        self.hey_linux_enabled = row.get_active()
+        self.save_config()
+        
+        autostart_dir = os.path.expanduser("~/.config/autostart")
+        desktop_file = os.path.join(autostart_dir, "hey-linux.desktop")
+        
+        if self.hey_linux_enabled:
+            os.makedirs(autostart_dir, exist_ok=True)
+            with open(desktop_file, "w") as f:
+                f.write("[Desktop Entry]\nName=Hey Linux Wake Word\nExec=/usr/bin/hey-linux\nType=Application\nNoDisplay=true\n")
+            
+            subprocess.run(["pkill", "-f", "/usr/bin/hey-linux"])
+            
+            model_path = os.path.expanduser(f"~/.cache/linexin/vosk-model-{self.vosk_lang}")
+            if not os.path.exists(model_path):
+                # Download model then start
+                url = f"https://alphacephei.com/vosk/models/vosk-model-{self.vosk_lang}.zip"
+                cmd_str = f"mkdir -p ~/.cache/linexin && rm -rf /tmp/vmodel && unzip -q -o /tmp/vmodel.zip -d /tmp/vmodel/ && mv /tmp/vmodel/* {model_path} && rm -rf /tmp/vmodel /tmp/vmodel.zip"
+                full_cmd_str = f"curl -L {url} -o /tmp/vmodel.zip && {cmd_str}"
+
+                win = _ActionProgressWindow(
+                    parent=self.window if self.window else self.get_root(),
+                    title=_("Downloading Wake Word Model"),
+                    cmd_string=full_cmd_str,
+                    poll_auth_file=False
+                )
+                def on_download_done(success):
+                    if success:
+                        subprocess.Popen(["/usr/bin/hey-linux"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                    else:
+                        row.set_active(False)
+                win.on_close_callback = on_download_done
+                win.present()
+            else:
+                subprocess.Popen(["/usr/bin/hey-linux"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        else:
+            if os.path.exists(desktop_file):
+                os.unlink(desktop_file)
+            subprocess.run(["pkill", "-f", "/usr/bin/hey-linux"])
 
     def _stt_start_vosk(self, btn):
         """Start Vosk-based speech-to-text (streaming recognition)."""
@@ -1595,8 +1682,16 @@ class LinexinAISysadminWidget(Gtk.Box):
         else:
             box.add_css_class("assistant-message-box")
 
+        # Handle multimodal content (list with text + image_url items)
+        image_data_urls = []
+        if isinstance(content, list):
+            text_content = self._extract_text_from_content(content)
+            image_data_urls = self._extract_images_from_content(content)
+        else:
+            text_content = content
+
         import html
-        escaped_content = html.escape(content)
+        escaped_content = html.escape(text_content)
         
         # Super-basic Markdown -> Pango Markup parser for LLM Aesthetics
         import re
@@ -1605,6 +1700,13 @@ class LinexinAISysadminWidget(Gtk.Box):
         parsed_markup = re.sub(r'```[a-zA-Z0-9]*\n?(.*?)```', r'<tt>\1</tt>', escaped_content, flags=re.DOTALL)
         # Single backticks (now supporting multiline)
         parsed_markup = re.sub(r'`(.*?)`', r'<tt>\1</tt>', parsed_markup, flags=re.DOTALL)
+        
+        # Protect <tt> blocks from bold/italic processing (underscores in filenames etc.)
+        _tt_blocks = []
+        def _save_tt(m):
+            _tt_blocks.append(m.group(0))
+            return f'\x00TT{len(_tt_blocks)-1}\x00'
+        parsed_markup = re.sub(r'<tt>.*?</tt>', _save_tt, parsed_markup, flags=re.DOTALL)
         
         # Headings (up to H3 as they map cleanly to big text in Pango)
         parsed_markup = re.sub(r'^### (.*?)$', r'<span size="large" weight="bold">\1</span>', parsed_markup, flags=re.MULTILINE)
@@ -1620,20 +1722,51 @@ class LinexinAISysadminWidget(Gtk.Box):
         # Italic (Must be parsed after Bold to prevent double-asterisk conflicts)
         parsed_markup = re.sub(r'\*(.*?)\*', r'<i>\1</i>', parsed_markup)
         parsed_markup = re.sub(r'_(.*?)_', r'<i>\1</i>', parsed_markup)
+        
+        # Restore <tt> blocks
+        for i, block in enumerate(_tt_blocks):
+            parsed_markup = parsed_markup.replace(f'\x00TT{i}\x00', block)
 
         if role == "user":
             box.set_halign(Gtk.Align.END)
-            label = Gtk.Label()
-            label.add_css_class("message-label")
-            label.set_markup(parsed_markup)
-            label.set_wrap(True)
-            label.set_selectable(True)
-            label.set_xalign(1.0)
             
-            bubble = Gtk.Box()
+            bubble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             bubble.add_css_class("message-bubble")
             bubble.add_css_class("user-bubble")
-            bubble.append(label)
+
+            # Render attached images as thumbnails inside the bubble
+            if image_data_urls:
+                from gi.repository import Gdk as _Gdk  # type: ignore
+                images_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+                images_box.set_halign(Gtk.Align.END)
+                for data_url in image_data_urls:
+                    try:
+                        b64_part = data_url.split(",", 1)[1] if "," in data_url else data_url
+                        raw = base64.b64decode(b64_part)
+                        texture = _Gdk.Texture.new_from_bytes(GLib.Bytes.new(raw))
+                        picture = Gtk.Picture.new_for_paintable(texture)
+                        picture.set_size_request(150, 150)
+                        picture.set_can_shrink(True)
+                        picture.set_content_fit(Gtk.ContentFit.COVER)
+                        frame = Gtk.Frame()
+                        frame.set_child(picture)
+                        images_box.append(frame)
+                    except Exception:
+                        pass
+                bubble.append(images_box)
+
+            if text_content.strip():
+                label = Gtk.Label()
+                label.add_css_class("message-label")
+                try:
+                    label.set_markup(parsed_markup)
+                except Exception:
+                    label.set_text(text_content)
+                label.set_wrap(True)
+                label.set_selectable(True)
+                label.set_xalign(1.0)
+                bubble.append(label)
+
             box.append(bubble)
         else:
             box.set_halign(Gtk.Align.START)
@@ -1648,7 +1781,10 @@ class LinexinAISysadminWidget(Gtk.Box):
             
             label = Gtk.Label()
             label.add_css_class("message-label")
-            label.set_markup(parsed_markup)
+            try:
+                label.set_markup(parsed_markup)
+            except Exception:
+                label.set_text(text_content)
             label.set_wrap(True)
             label.set_selectable(True)
             label.set_xalign(0.0)
@@ -1858,7 +1994,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             _("Small (~461 MB, recommended)"),
             _("Medium (~1.5 GB, most accurate)")
         ]
-        whisper_model_selected = 2  # default: small
+        whisper_model_selected = 1  # default: base
         for i, label in enumerate(whisper_model_labels):
             whisper_model_list.append(label)
             if self._whisper_model_options[i] == self.whisper_model:
@@ -1961,6 +2097,18 @@ class LinexinAISysadminWidget(Gtk.Box):
 
         stt_backend_row.connect("notify::selected", sync_stt_visibility)
         sync_stt_visibility()  # apply initial state
+
+        # --- Hey Linux Daemon ---
+        hey_linux_group = Adw.PreferencesGroup(
+            title=_("Hey Linux Wake Word"), 
+            description=_("Continuously listens for 'Hey Linux' to activate the assistant. Uses Vosk lightweight STT.")
+        )
+        page_speech.add(hey_linux_group)
+
+        self.hey_linux_row = Adw.SwitchRow(title=_("Enable Wake Word Daemon"))
+        self.hey_linux_row.set_active(self.hey_linux_enabled)
+        self.hey_linux_row.connect("notify::active", self._on_hey_linux_toggled)
+        hey_linux_group.add(self.hey_linux_row)
 
         vc_group = Adw.PreferencesGroup(
             title=_("Voice Correction"), 
@@ -2446,13 +2594,147 @@ class LinexinAISysadminWidget(Gtk.Box):
             print(f"[Voice correction] Failed, using raw text: {e}")
             return raw_text
 
+    # --- Image / Vision support ---
+
+    def _on_clipboard_texture_ready(self, clipboard, result):
+        """Callback for async clipboard texture read."""
+        try:
+            texture = clipboard.read_texture_finish(result)
+            if texture:
+                self._add_image_from_texture(texture)
+        except Exception as e:
+            print(f"[Image paste] Failed: {e}")
+
+    def _on_texture_drop(self, drop_target, value, x, y):
+        """Handle a Gdk.Texture dropped onto the input area."""
+        self._add_image_from_texture(value)
+        return True
+
+    def _on_file_list_drop(self, drop_target, value, x, y):
+        """Handle files dropped from a file manager onto the input area."""
+        files = value.get_files()
+        for gfile in files:
+            path = gfile.get_path()
+            if path and self._is_image_file(path):
+                self._add_image_from_file(path)
+        return True
+
+    def _is_image_file(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        return ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".tif", ".webp")
+
+    def _guess_mime_type(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        mime_map = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".gif": "image/gif", ".bmp": "image/bmp", ".tiff": "image/tiff",
+            ".tif": "image/tiff", ".webp": "image/webp",
+        }
+        return mime_map.get(ext, "image/png")
+
+    def _add_image_from_texture(self, texture):
+        """Convert a Gdk.Texture to base64 PNG and add it to pending images."""
+        try:
+            png_bytes = texture.save_to_png_bytes()
+            raw = png_bytes.get_data()
+            b64 = base64.b64encode(raw).decode('ascii')
+            self._add_pending_image(b64, "image/png", texture)
+        except Exception as e:
+            print(f"[Image] Failed to encode texture: {e}")
+
+    def _add_image_from_file(self, path):
+        """Read an image file and add it to pending images."""
+        try:
+            from gi.repository import Gdk  # type: ignore
+            with open(path, 'rb') as f:
+                raw = f.read()
+            mime = self._guess_mime_type(path)
+            b64 = base64.b64encode(raw).decode('ascii')
+            texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(raw))
+            self._add_pending_image(b64, mime, texture)
+        except Exception as e:
+            print(f"[Image] Failed to load file {path}: {e}")
+
+    def _add_pending_image(self, b64_data, mime_type, texture=None):
+        """Add an image to the pending list and update the preview strip."""
+        self.pending_images.append((mime_type, b64_data))
+        self._rebuild_image_preview()
+
+    def _remove_pending_image(self, index):
+        """Remove an image from the pending list by index."""
+        if 0 <= index < len(self.pending_images):
+            self.pending_images.pop(index)
+            self._rebuild_image_preview()
+
+    def _rebuild_image_preview(self):
+        """Rebuild the image preview strip from the pending images list."""
+        from gi.repository import Gdk  # type: ignore
+        # Clear existing preview children
+        while True:
+            child = self.image_preview_box.get_first_child()
+            if child is None:
+                break
+            self.image_preview_box.remove(child)
+
+        for idx, (mime_type, b64_data) in enumerate(self.pending_images):
+            raw = base64.b64decode(b64_data)
+            try:
+                texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(raw))
+            except Exception:
+                continue
+
+            overlay = Gtk.Overlay()
+            picture = Gtk.Picture.new_for_paintable(texture)
+            picture.set_size_request(60, 60)
+            picture.set_can_shrink(True)
+            picture.set_content_fit(Gtk.ContentFit.COVER)
+            frame = Gtk.Frame()
+            frame.set_child(picture)
+            frame.set_size_request(60, 60)
+            overlay.set_child(frame)
+
+            close_btn = Gtk.Button(icon_name="window-close-symbolic")
+            close_btn.add_css_class("circular")
+            close_btn.add_css_class("osd")
+            close_btn.set_halign(Gtk.Align.END)
+            close_btn.set_valign(Gtk.Align.START)
+            close_btn.set_margin_top(2)
+            close_btn.set_margin_end(2)
+            captured_idx = idx
+            close_btn.connect("clicked", lambda b, i=captured_idx: self._remove_pending_image(i))
+            overlay.add_overlay(close_btn)
+
+            self.image_preview_box.append(overlay)
+
+        self.image_preview_box.set_visible(len(self.pending_images) > 0)
+
+    def _extract_text_from_content(self, content):
+        """Extract plain text from a message content (handles both str and multimodal list)."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text")
+        return str(content)
+
+    def _extract_images_from_content(self, content):
+        """Extract image data URLs from a multimodal content list."""
+        if not isinstance(content, list):
+            return []
+        images = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "image_url":
+                url = item.get("image_url", {}).get("url", "")
+                if url:
+                    images.append(url)
+        return images
+
     def on_send_clicked(self, widget):
         if getattr(self, 'llm_processing', False) or getattr(self, 'tts_playing', False):
             self.cancel_generation()
             return
             
         text = self.entry.get_text().strip()
-        if not text:
+        if not text and not self.pending_images:
             return
 
         if self.stt_toggle.get_active():
@@ -2465,6 +2747,11 @@ class LinexinAISysadminWidget(Gtk.Box):
         if self.backend == "direct" and not self.api_key:
             self.add_message_bubble("assistant", _("Please configure your API Key in settings first."))
             return
+
+        # Capture pending images before clearing
+        images = list(self.pending_images)
+        self.pending_images.clear()
+        self._rebuild_image_preview()
 
         self.entry.set_text("")
         self.entry.set_sensitive(False)
@@ -2487,15 +2774,28 @@ class LinexinAISysadminWidget(Gtk.Box):
                 corrected = self._correct_voice_text(text)
                 if getattr(self, 'abort_processing', False):
                     return
-                GLib.idle_add(self._proceed_with_message, corrected)
+                GLib.idle_add(self._proceed_with_message, corrected, images)
             threading.Thread(target=voice_correction_thread, daemon=True).start()
         else:
-            self._proceed_with_message(text)
+            self._proceed_with_message(text, images)
 
-    def _proceed_with_message(self, text):
+    def _proceed_with_message(self, text, images=None):
         """Add the (possibly corrected) user message to the UI and fire the AI call."""
-        self.add_message_bubble("user", text)
-        self.chat_history.append({"role": "user", "content": text})
+        if images:
+            # Build multimodal content (OpenAI vision format)
+            content = []
+            if text:
+                content.append({"type": "text", "text": text})
+            for mime_type, b64_data in images:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{b64_data}"}
+                })
+            self.add_message_bubble("user", content)
+            self.chat_history.append({"role": "user", "content": content})
+        else:
+            self.add_message_bubble("user", text)
+            self.chat_history.append({"role": "user", "content": text})
         self._show_thinking_indicator()
         threading.Thread(target=self.call_ai, daemon=True).start()
 
@@ -2613,9 +2913,29 @@ class LinexinAISysadminWidget(Gtk.Box):
             GLib.idle_add(self.on_api_error, _("No local model selected. Please open settings and pull an AI model."))
             return
             
+        # Transform messages for Ollama format (images use separate 'images' key)
+        ollama_messages = []
+        for msg in self.chat_history:
+            if isinstance(msg.get("content"), list):
+                text_parts = []
+                images = []
+                for item in msg["content"]:
+                    if item.get("type") == "text":
+                        text_parts.append(item["text"])
+                    elif item.get("type") == "image_url":
+                        url = item["image_url"]["url"]
+                        if "," in url:
+                            images.append(url.split(",", 1)[1])
+                ollama_msg = {"role": msg["role"], "content": "\n".join(text_parts)}
+                if images:
+                    ollama_msg["images"] = images
+                ollama_messages.append(ollama_msg)
+            else:
+                ollama_messages.append(msg)
+
         data = {
             "model": self.local_model,
-            "messages": self.chat_history,
+            "messages": ollama_messages,
             "stream": False
         }
         req = urllib.request.Request(self.local_url, data=json.dumps(data).encode('utf-8'), headers={
@@ -2856,7 +3176,32 @@ class LinexinAISysadminWidget(Gtk.Box):
 
         # We only pass the latest message to Qwen CLI.
         # Qwen's internal SQLite database handles the conversation memory via --chat-recording.
-        latest_msg = self.chat_history[-1]['content']
+        latest_content = self.chat_history[-1]['content']
+        latest_msg = self._extract_text_from_content(latest_content)
+        
+        # Qwen CLI supports vision via local file paths — save images to /tmp/linexin/
+        image_paths = []
+        if isinstance(latest_content, list) and self._extract_images_from_content(latest_content):
+            tmp_dir = os.path.expanduser("~/.qwen/tmp")
+            os.makedirs(tmp_dir, exist_ok=True)
+            for data_url in self._extract_images_from_content(latest_content):
+                try:
+                    header, b64_data = data_url.split(",", 1) if "," in data_url else ("", data_url)
+                    # Determine extension from MIME type
+                    ext = ".png"
+                    if "jpeg" in header or "jpg" in header:
+                        ext = ".jpg"
+                    elif "gif" in header:
+                        ext = ".gif"
+                    elif "webp" in header:
+                        ext = ".webp"
+                    img_filename = f"{uuid.uuid4().hex}{ext}"
+                    img_path = os.path.join(tmp_dir, img_filename)
+                    with open(img_path, "wb") as f:
+                        f.write(base64.b64decode(b64_data))
+                    image_paths.append(img_path)
+                except Exception as e:
+                    print(f"[Qwen CLI] Failed to save image: {e}")
         
         # Override Qwen CLI's internal autonomous execution tools.
         # If we don't, Qwen attempts to run sudo in its own hidden background PTY and fails.
@@ -2876,8 +3221,14 @@ class LinexinAISysadminWidget(Gtk.Box):
                 # Need to use --resume if the session already exists, or --session-id if first prompt
                 session_flag = f"--resume {self.qwen_session_id}" if self.qwen_session_started else f"--session-id {self.qwen_session_id}"
                 
+                # Build image flags for vision support
+                image_flags = " ".join(shlex.quote(p) for p in image_paths) if image_paths else ""
+                
                 # Wrap the command in bash to resolve .nvm / .npm-global
-                bash_wrapper = self.get_qwen_env_cmd(f"{cmd} {escaped_prompt} --auth-type qwen-oauth --chat-recording {session_flag} --yolo")
+                qwen_cmd = f"{cmd} {escaped_prompt} --auth-type qwen-oauth --chat-recording {session_flag} --yolo"
+                if image_flags:
+                    qwen_cmd += f" {image_flags}"
+                bash_wrapper = self.get_qwen_env_cmd(qwen_cmd)
                 self.qwen_proc = subprocess.Popen(["bash", "-c", bash_wrapper], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 stdout, stderr = self.qwen_proc.communicate(timeout=120)
                 
@@ -2956,54 +3307,24 @@ class LinexinAISysadminWidget(Gtk.Box):
             if on_ready:
                 GLib.idle_add(on_ready)
             return
-
-        # Simple fast heuristic language detection
-        def detect_lang(txt):
-            txt_lower = txt.lower()
-            if re.search(r'[\u4e00-\u9fff]', txt): return 'zh'
-            if re.search(r'[\u3040-\u30ff]', txt): return 'ja'
-            if re.search(r'[\uac00-\ud7af]', txt): return 'ko'
-            if re.search(r'[\u0400-\u04FF]', txt):
-                if re.search(r'[іїєґ]', txt_lower): return 'uk'
-                return 'ru'
-            words = set(re.findall(r'\b\w+\b', txt_lower))
-            langs = {
-                'pl': {'jest', 'nie', 'to', 'że', 'w', 'z', 'i', 'na', 'do', 'tak', 'dla', 'o', 'ale', 'jak'},
-                'fr': {'le', 'la', 'les', 'un', 'une', 'et', 'à', 'est', 'en', 'pour', 'dans'},
-                'de': {'der', 'die', 'das', 'und', 'ist', 'in', 'den', 'von', 'zu', 'für', 'mit'},
-                'es': {'el', 'la', 'los', 'las', 'un', 'una', 'y', 'en', 'es', 'por', 'con'},
-                'pt': {'o', 'a', 'os', 'as', 'um', 'uma', 'e', 'em', 'é', 'por', 'com'},
-                'it': {'il', 'la', 'i', 'le', 'un', 'una', 'e', 'in', 'è', 'per', 'con'},
-                'en': {'the', 'be', 'to', 'of', 'and', 'a', 'in', 'that', 'have', 'i', 'it'}
-            }
-            best_lang = "en"
-            max_matches = 0
-            for l, stop_words in langs.items():
-                matches = len(words.intersection(stop_words))
-                if matches > max_matches:
-                    max_matches = matches
-                    best_lang = l
-            return best_lang
-
-        detected_lang = detect_lang(clean_text)
         
-        piper_models = {
-            "en": ("en_US-libritts_r-medium", "en/en_US/libritts_r/medium"),
-            "zh": ("zh_CN-huayan-medium", "zh/zh_CN/huayan/medium"),
-            "fr": ("fr_FR-siwis-low", "fr/fr_FR/siwis/low"),
-            "de": ("de_DE-thorsten-medium", "de/de_DE/thorsten/medium"),
-            "es": ("es_ES-sharvard-medium", "es/es_ES/sharvard/medium"),
-            "pt": ("pt_PT-tugao-medium", "pt/pt_PT/tugao/medium"),
-            "it": ("it_IT-riccardo-x_low", "it/it_IT/riccardo/x_low"),
-            "ru": ("ru_RU-denis-medium", "ru/ru_RU/denis/medium"),
-            "uk": ("uk_UA-ukromir-medium", "uk/uk_UA/ukromir/medium"),
-            "pl": ("pl_PL-gosia-medium", "pl/pl_PL/gosia/medium"),
-            "ja": ("ESPEAK", "ja"),
-            "ko": ("ESPEAK", "ko")
+        lang_map = {
+            "small-en-us-0.15": ("en_US-libritts_r-medium", "en/en_US/libritts_r/medium"),
+            "small-en-in-0.4": ("en_GB-alba-medium", "en/en_GB/alba/medium"),
+            "small-cn-0.22": ("zh_CN-huayan-medium", "zh/zh_CN/huayan/medium"),
+            "small-fr-0.22": ("fr_FR-siwis-low", "fr/fr_FR/siwis/low"),
+            "small-de-0.15": ("de_DE-thorsten-medium", "de/de_DE/thorsten/medium"),
+            "small-es-0.42": ("es_ES-sharvard-medium", "es/es_ES/sharvard/medium"),
+            "small-pt-0.3": ("pt_PT-tugao-medium", "pt/pt_PT/tugao/medium"),
+            "small-it-0.22": ("it_IT-riccardo-x_low", "it/it_IT/riccardo/x_low"),
+            "small-ru-0.22": ("ru_RU-denis-medium", "ru/ru_RU/denis/medium"),
+            "small-uk-v3-nano": ("uk_UA-ukromir-medium", "uk/uk_UA/ukromir/medium"),
+            "small-pl-0.22": ("pl_PL-gosia-medium", "pl/pl_PL/gosia/medium"),
+            "small-ja-0.22": ("ESPEAK", "ja"),
+            "small-ko-0.22": ("ESPEAK", "ko")
         }
-        
         fallback = ("en_US-libritts_r-medium", "en/en_US/libritts_r/medium")
-        model_name, model_path = piper_models.get(detected_lang, fallback)
+        model_name, model_path = lang_map.get(self.vosk_lang, fallback)
         
         # Fast-track unsupported AI languages to espeak-ng natively
         if model_name == "ESPEAK":

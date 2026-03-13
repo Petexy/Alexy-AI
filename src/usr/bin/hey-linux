@@ -2,61 +2,54 @@
 """
 hey-linux — Wake word listener daemon for Linexin AI Sysadmin.
 
-Continuously listens for the phrase "Hey Linux" using the configured STT backend
-(Whisper or Vosk), then launches the AI Sysadmin widget with voice-to-text
+Continuously listens for the phrase "Hey Linux" using Vosk,
+then launches the AI Sysadmin widget asynchronously with voice-to-text
 automatically active.
 
 Usage:
-    hey-linux                          # Use config defaults
-    hey-linux --backend whisper        # Force Whisper backend
-    hey-linux --backend vosk           # Force Vosk backend
-    hey-linux --whisper-model small    # Override Whisper model size
+    hey-linux
 """
 
 import os
 import sys
 import json
 import signal
-import struct
 import subprocess
-import tempfile
 import time
-import wave
 import argparse
 
 CONFIG_DIR = os.path.expanduser("~/.config/linexin-center")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "ai-sysadmin.json")
 
-WAKE_PHRASES = ["hey linux", "hey linex", "hey lynux", "hey lenux", "hey linuxin", "hey lennox"]
+WAKE_PHRASES = [
+    "hey linux", "hey linex", "hey lynux", "hey lenux", "hey linuxin", "hey lennox",
+    "hail linux", "helly nux", "hello linux", "hi linux", "low linux", "hay linux",
+    "a linux", "i linux", "hey minix", "hey lino"
+]
 LINEXIN_CENTER = "linexin-center"
 
 
 def load_config():
     """Load STT settings from the shared config file."""
     config = {
-        "stt_backend": "whisper",
-        "whisper_model": "small",
         "vosk_lang": "small-en-us-0.15",
     }
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 saved = json.load(f)
-            for key in config:
-                if key in saved:
-                    config[key] = saved[key]
+            if "vosk_lang" in saved:
+                config["vosk_lang"] = saved["vosk_lang"]
         except Exception as e:
             print(f"[hey-linux] Warning: Could not read config: {e}")
     return config
 
 
-def detect_wake_word_whisper(whisper_model, whisper_lang=None):
-    """Record audio and check for wake word using Whisper. Returns True if detected."""
-    import whisper as whisper_module  # type: ignore
-
+def listen_for_wake_word_vosk(vosk_recognizer):
+    """Listen continuously and block until wake word is detected."""
+    import json
     SAMPLE_RATE = 16000
     CHUNK_SIZE = 4000
-    LISTEN_DURATION = 3.0  # seconds per chunk to analyze
 
     proc = subprocess.Popen(
         ["arecord", "-f", "S16_LE", "-c", "1", "-r", str(SAMPLE_RATE), "-q"],
@@ -64,77 +57,8 @@ def detect_wake_word_whisper(whisper_model, whisper_lang=None):
         stderr=subprocess.DEVNULL,
     )
 
-    audio_frames: list[bytes] = []
-    start_time = time.time()
-
     try:
-        while time.time() - start_time < LISTEN_DURATION:
-            if proc.poll() is not None:
-                break
-            stdout = proc.stdout
-            if stdout is None:
-                break
-            data: bytes = stdout.read(CHUNK_SIZE)  # type: ignore
-            if not data:
-                break
-            audio_frames.append(data)
-    finally:
-        proc.terminate()
-        proc.wait()
-
-    if not audio_frames:
-        return False
-
-    # Write to temp WAV
-    tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, prefix="hey-linux-")
-    tmp_wav_path = tmp_wav.name
-    try:
-        with wave.open(tmp_wav_path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            raw_audio: bytes = b"".join(audio_frames)
-            wf.writeframes(raw_audio)
-
-        result = whisper_model.transcribe(
-            tmp_wav_path, fp16=False
-        )
-        text = result.get("text", "").strip().lower()
-    finally:
-        try:
-            os.unlink(tmp_wav_path)
-        except Exception:
-            pass
-
-    if text:
-        # Check for wake phrase (fuzzy match)
-        for phrase in WAKE_PHRASES:
-            if phrase in text:
-                print(f"[hey-linux] Wake word detected in: \"{text}\"")
-                return True
-        # Debug: show what was heard
-        if len(text) > 2:
-            print(f"[hey-linux] Heard: \"{text}\"")
-    return False
-
-
-def detect_wake_word_vosk(vosk_recognizer, vosk_lang):
-    """Record audio and check for wake word using Vosk streaming. Returns True if detected."""
-    SAMPLE_RATE = 16000
-    CHUNK_SIZE = 4000
-    LISTEN_DURATION = 3.0
-
-    proc = subprocess.Popen(
-        ["arecord", "-f", "S16_LE", "-c", "1", "-r", str(SAMPLE_RATE), "-q"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-
-    start_time = time.time()
-    detected = False
-
-    try:
-        while time.time() - start_time < LISTEN_DURATION:
+        while True:
             if proc.poll() is not None:
                 break
             stdout = proc.stdout
@@ -155,15 +79,12 @@ def detect_wake_word_vosk(vosk_recognizer, vosk_lang):
                 for phrase in WAKE_PHRASES:
                     if phrase in text:
                         print(f'[hey-linux] Wake word detected in: "{text}"')
-                        detected = True
-                        break
-            if detected:
-                break
+                        return True
     finally:
         proc.terminate()
         proc.wait()
 
-    return detected
+    return False
 
 
 def send_notification(title, body):
@@ -179,7 +100,7 @@ def send_notification(title, body):
 
 
 def launch_widget():
-    """Launch linexin-center with the AI widget in voice mode and wait for it to exit."""
+    """Launch linexin-center asynchronously."""
     # Try to find linexin-center: first in PATH, then relative to this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
@@ -204,36 +125,24 @@ def launch_widget():
         print(f"[hey-linux] Error: Could not find {LINEXIN_CENTER}")
         return
 
-    print(f"[hey-linux] Launching: {cmd} -w r-ai-sysadmin-widget --voice")
+    print(f"[hey-linux] Launching asynchronously: {cmd} -w r-ai-sysadmin-widget --voice")
     assert cmd is not None
     args: list[str] = [sys.executable, cmd, "-w", "r-ai-sysadmin-widget", "--voice"]
-    proc = subprocess.Popen(
+    subprocess.Popen(
         args,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=True # Detach entirely
     )
-    proc.wait()
-    print("[hey-linux] Widget closed. Resuming listening...")
 
 
 def main():
     parser = argparse.ArgumentParser(
         description='Hey Linux — Wake word listener for Linexin AI Sysadmin'
     )
-    parser.add_argument(
-        "--backend", choices=["whisper", "vosk"], default=None,
-        help="STT backend to use (default: from config)"
-    )
-    parser.add_argument(
-        "--whisper-model", choices=["tiny", "base", "small", "medium"], default=None,
-        help="Whisper model size (default: from config)"
-    )
-    args = parser.parse_args()
+    parser.parse_args()
 
     config = load_config()
-    backend = args.backend or config["stt_backend"]
-    whisper_model_name = args.whisper_model or config["whisper_model"]
-
     vosk_lang = config["vosk_lang"]
 
     # Handle clean shutdown
@@ -247,63 +156,39 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    print(f"[hey-linux] Starting wake word listener (backend: {backend})")
+    print(f"[hey-linux] Starting wake word listener (backend: vosk)")
     print(f"[hey-linux] Say \"Hey Linux\" to activate the AI assistant.")
 
     # Initialize the STT engine
-    if backend == "whisper":
+    try:
+        import vosk  # type: ignore
+    except ImportError:
+        print("[hey-linux] Error: python-vosk is not installed.")
+        print("[hey-linux] Install it with: pkexec pacman -S python-vosk")
+        sys.exit(1)
+
+    vosk.SetLogLevel(-1)
+    model_path = os.path.expanduser(f"~/.cache/linexin/vosk-model-{vosk_lang}")
+    if not os.path.exists(model_path):
+        print(f"[hey-linux] Error: Vosk model not found at {model_path}")
+        print("[hey-linux] Please open the AI Sysadmin widget and click the mic button to download it first.")
+        sys.exit(1)
+
+    print(f"[hey-linux] Loading Vosk model from {model_path}...")
+    vosk_model = vosk.Model(model_path)
+    print("[hey-linux] Model loaded. Listening for wake word...")
+
+    while running:
         try:
-            import whisper as whisper_module  # type: ignore
-        except ImportError:
-            print("[hey-linux] Error: openai-whisper is not installed.")
-            print("[hey-linux] Install it with: pip install openai-whisper")
-            sys.exit(1)
-
-        print(f"[hey-linux] Loading Whisper model '{whisper_model_name}'...")
-        model = whisper_module.load_model(whisper_model_name)
-        print("[hey-linux] Model loaded. Listening for wake word...")
-
-        while running:
-            try:
-                if detect_wake_word_whisper(model):
-                    send_notification("Hey Linux", "Activating AI assistant...")
-                    launch_widget()
-                    if running:
-                        print("[hey-linux] Listening for wake word...")
-            except Exception as e:
-                print(f"[hey-linux] Error: {e}")
-                time.sleep(1)
-
-    elif backend == "vosk":
-        try:
-            import vosk  # type: ignore
-        except ImportError:
-            print("[hey-linux] Error: python-vosk is not installed.")
-            print("[hey-linux] Install it with: sudo pacman -S python-vosk")
-            sys.exit(1)
-
-        vosk.SetLogLevel(-1)
-        model_path = os.path.expanduser(f"~/.cache/linexin/vosk-model-{vosk_lang}")
-        if not os.path.exists(model_path):
-            print(f"[hey-linux] Error: Vosk model not found at {model_path}")
-            print("[hey-linux] Please open the AI Sysadmin widget and click the mic button to download it first.")
-            sys.exit(1)
-
-        print(f"[hey-linux] Loading Vosk model from {model_path}...")
-        vosk_model = vosk.Model(model_path)
-        print("[hey-linux] Model loaded. Listening for wake word...")
-
-        while running:
-            try:
-                recognizer = vosk.KaldiRecognizer(vosk_model, 16000)
-                if detect_wake_word_vosk(recognizer, vosk_lang):
-                    send_notification("Hey Linux", "Activating AI assistant...")
-                    launch_widget()
-                    if running:
-                        print("[hey-linux] Listening for wake word...")
-            except Exception as e:
-                print(f"[hey-linux] Error: {e}")
-                time.sleep(1)
+            recognizer = vosk.KaldiRecognizer(vosk_model, 16000)
+            if listen_for_wake_word_vosk(recognizer):
+                send_notification("Hey Linux", "Activating AI assistant...")
+                launch_widget()
+                if running:
+                    print("[hey-linux] Resuming listening...")
+        except Exception as e:
+            print(f"[hey-linux] Error: {e}")
+            time.sleep(1)
 
     print("[hey-linux] Stopped.")
 
