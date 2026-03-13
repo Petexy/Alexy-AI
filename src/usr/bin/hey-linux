@@ -101,38 +101,36 @@ def send_notification(title, body):
 
 def launch_widget():
     """Launch linexin-center asynchronously."""
+    import shutil
     # Try to find linexin-center: first in PATH, then relative to this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
-        LINEXIN_CENTER,  # system PATH
+        shutil.which(LINEXIN_CENTER),  # system PATH (resolved to full path)
         os.path.join(script_dir, LINEXIN_CENTER),  # same directory
     ]
 
     cmd = None
     for c in candidates:
-        # Check if it exists (for absolute paths) or is in PATH
-        if os.path.isfile(c):
+        if c and os.path.isfile(c):
             cmd = c
             break
-        try:
-            subprocess.run(["which", c], capture_output=True, check=True)
-            cmd = c
-            break
-        except Exception:
-            continue
 
     if cmd is None:
         print(f"[hey-linux] Error: Could not find {LINEXIN_CENTER}")
         return
 
-    print(f"[hey-linux] Launching asynchronously: {cmd} -w r-ai-sysadmin-widget --voice")
-    assert cmd is not None
-    args: list[str] = [sys.executable, cmd, "-w", "r-ai-sysadmin-widget", "--voice"]
+    # Set env var so linexin-center opens as a new independent instance
+    # instead of re-activating an existing one (which would ignore our args).
+    env = os.environ.copy()
+    env["LINEXIN_NEW_INSTANCE"] = "1"
+
+    print(f"[hey-linux] Launching: {cmd} -w r-ai-sysadmin-widget --voice")
     subprocess.Popen(
-        args,
+        [cmd, "-w", "r-ai-sysadmin-widget", "--voice"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        start_new_session=True # Detach entirely
+        start_new_session=True,
+        env=env
     )
 
 

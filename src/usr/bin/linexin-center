@@ -1499,7 +1499,8 @@ Hidden=false
 class WidgetLoaderApp(Adw.Application):
     """Main application class."""
     def __init__(self, **kwargs):
-        super().__init__(application_id=APP_ID, **kwargs) # type: ignore
+        flags = Gio.ApplicationFlags.NON_UNIQUE if os.environ.get("LINEXIN_NEW_INSTANCE") else Gio.ApplicationFlags.FLAGS_NONE
+        super().__init__(application_id=APP_ID, flags=flags, **kwargs) # type: ignore
         self.connect('activate', self.on_activate)
         self.hide_sidebar = False
         self.target_widget = None

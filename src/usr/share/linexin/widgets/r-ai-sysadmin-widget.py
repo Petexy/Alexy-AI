@@ -502,8 +502,14 @@ class MultilineEntry(Gtk.ScrolledWindow):
 class LinexinAISysadminWidget(Gtk.Box):
     def __init__(self, hide_sidebar=False, window=None, sudo_manager=None, voice_autostart=False, **kwargs):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12) # type: ignore
-        self.widgetname = "AI Sysadmin"
-        self.widgeticon = "utilities-terminal-symbolic"
+        self.widgetname = "Alexy AI"
+        self.alexy_icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "icons", "github.petexy.alexy.svg")
+        if not os.path.isfile(self.alexy_icon_path):
+            self.alexy_icon_path = "/usr/share/icons/github.petexy.alexy.svg"
+        if os.path.isfile(self.alexy_icon_path):
+            self.widgeticon = self.alexy_icon_path
+        else:
+            self.widgeticon = "utilities-terminal-symbolic"
         self.set_margin_top(12)
         self.set_margin_bottom(50)
         self.set_margin_start(50)
@@ -1077,17 +1083,20 @@ class LinexinAISysadminWidget(Gtk.Box):
         header_svg = self._get_theme_svg("header-icon.svg")
         if header_svg:
             system_icon = Gtk.Image.new_from_file(header_svg)
+        elif os.path.isfile(self.alexy_icon_path):
+            system_icon = Gtk.Image.new_from_file(self.alexy_icon_path)
         else:
             system_icon = Gtk.Image.new_from_icon_name("system-run-symbolic")
-        system_icon.set_pixel_size(48)
+        system_icon.set_pixel_size(100)
         self.header_icon_widget = system_icon
         header_box.append(system_icon)
         
         title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         title_box.set_hexpand(True)
+        title_box.set_valign(Gtk.Align.CENTER)
         
-        title_label = Gtk.Label(label=_("AI Sysadmin"))
-        title_label.add_css_class("title-2")
+        title_label = Gtk.Label(label=_("Alexy AI"))
+        title_label.add_css_class("title-1")
         title_label.set_halign(Gtk.Align.START)
         title_box.append(title_label)
         
@@ -1480,6 +1489,7 @@ class LinexinAISysadminWidget(Gtk.Box):
 
                 if text:
                     self._last_input_was_voice = True
+                    GLib.idle_add(self.entry.set_placeholder_text, _("Ask a question..."))
                     GLib.idle_add(self.entry.set_text, text)
                     GLib.idle_add(self.stt_toggle.set_active, False)
                     GLib.idle_add(self.send_btn.emit, "clicked")
@@ -1646,11 +1656,11 @@ class LinexinAISysadminWidget(Gtk.Box):
 
     def update_subtitle(self):
         if self.backend == "direct":
-            self.subtitle_label.set_label(_(f"Alexy (Online API: {self.model})"))
+            self.subtitle_label.set_label(_(f"Online API: {self.model}"))
         elif self.backend == "qwen_cli":
-            self.subtitle_label.set_label(_("Alexy (Qwen CLI Wrapper)"))
+            self.subtitle_label.set_label(_("Qwen CLI Wrapper"))
         elif self.backend == "local":
-            self.subtitle_label.set_label(_(f"Alexy (Local AI: {self.local_model})"))
+            self.subtitle_label.set_label(_(f"Local AI: {self.local_model}"))
 
     def add_message_bubble(self, role, content, is_html=False):
         row = Gtk.ListBoxRow()
@@ -1773,6 +1783,8 @@ class LinexinAISysadminWidget(Gtk.Box):
             avatar_svg = self._get_theme_svg("assistant-avatar.svg")
             if avatar_svg:
                 icon = Gtk.Image.new_from_file(avatar_svg)
+            elif os.path.isfile(self.alexy_icon_path):
+                icon = Gtk.Image.new_from_file(self.alexy_icon_path)
             else:
                 icon = Gtk.Image.new_from_icon_name(self.widgeticon)
             icon.set_pixel_size(24)
@@ -2262,6 +2274,8 @@ class LinexinAISysadminWidget(Gtk.Box):
                     header_svg = self._get_theme_svg("header-icon.svg")
                     if header_svg:
                         self.header_icon_widget.set_from_file(header_svg)
+                    elif os.path.isfile(self.alexy_icon_path):
+                        self.header_icon_widget.set_from_file(self.alexy_icon_path)
                     else:
                         self.header_icon_widget.set_from_icon_name("system-run-symbolic")
                         
@@ -2830,7 +2844,10 @@ class LinexinAISysadminWidget(Gtk.Box):
             box.append(bubble)
         else:
             # Fallback to standard animated spinner with avatar
-            icon = Gtk.Image.new_from_icon_name(self.widgeticon)
+            if os.path.isfile(self.alexy_icon_path):
+                icon = Gtk.Image.new_from_file(self.alexy_icon_path)
+            else:
+                icon = Gtk.Image.new_from_icon_name(self.widgeticon)
             icon.set_pixel_size(24)
             icon.set_valign(Gtk.Align.START)
             box.append(icon)
