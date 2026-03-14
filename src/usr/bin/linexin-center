@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import atexit
 import re
+import json
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -195,9 +196,33 @@ else:
     LOCALIZATION_BASE_DIR = "/usr/share/linexin/widgets/localization"
     print(f"DEBUG: Running from system install. Paths set to {WIDGET_DIRECTORY}")
 SIDEBAR_WIDTH = 330
+SIDEBAR_COMPACT_WIDTH = 62
 ICON_SIZE = 32
+COMPACT_ICON_SIZE = 28
+COMPACT_ANIM_DURATION = 350
 APP_ID = "github.petexy.linexincenter"
 FALLBACK_LANGUAGE = "en_US"
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "linexin")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "linexin-center.json")
+
+def _load_config():
+    """Load app configuration from JSON file."""
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def _save_config(config):
+    """Save app configuration to JSON file."""
+    try:
+        os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=2)
+    except Exception as e:
+        print(f"Error saving config: {e}")
 _original_popen = subprocess.Popen
 _original_run = subprocess.run
 _original_call = subprocess.call
@@ -524,6 +549,13 @@ class WidgetLoaderWindow(Adw.ApplicationWindow):
         self.first_widget_loaded = False
         self.selection_timeout_id = None
         self.pending_widget_selection = None
+        self._compact_mode = False
+        self._saved_compact = _load_config().get("compact_mode", False)
+        self._sidebar_rows: list = []
+        self._compact_icon_buttons: list = []
+        self._sidebar_anim: Optional[Adw.TimedAnimation] = None
+        self._btn_rotate_anim: Optional[Adw.TimedAnimation] = None
+        self._btn_rotation_deg = 180.0
         global _global_lock_manager
         _global_lock_manager = CommandLockManager()
         _global_lock_manager.set_window(self)
@@ -535,6 +567,9 @@ class WidgetLoaderWindow(Adw.ApplicationWindow):
             GLib.timeout_add(50, self._staged_load_step1)
         else:
             self._load_all_widgets()
+        # Apply saved compact mode after UI is built
+        if not self.hide_sidebar and self._saved_compact:
+            GLib.idle_add(self._apply_saved_compact)
     def resize_window(self, width, height):
         """Custom resize method that tries different approaches"""
         try:
@@ -562,40 +597,42 @@ class WidgetLoaderWindow(Adw.ApplicationWindow):
         self.is_command_locked = locked
         self.widget_list.set_sensitive(not locked)
         if hasattr(self, 'sidebar_page') and not self.hide_sidebar:
-            sidebar_header = self.sidebar_page.get_child().get_first_child()
+            sidebar_header = self.sidebar_container.get_first_child()
             if sidebar_header and isinstance(sidebar_header, Gtk.HeaderBar):
-                if locked:
-                    sidebar_header.add_css_class("command-locked-controls")
-                else:
-                    sidebar_header.remove_css_class("command-locked-controls")
+                self._set_window_controls_disabled(sidebar_header, locked)
         if hasattr(self, 'content_header'):
-            if locked:
-                self.content_header.add_css_class("command-locked-controls")
-            else:
-                self.content_header.remove_css_class("command-locked-controls")
+            self._set_window_controls_disabled(self.content_header, locked)
         if hasattr(self, 'split_view') and hasattr(self.split_view, 'set_show_content'):
             self.split_view.set_show_content(not locked)
         if locked:
             self._block_wm_close()
         else:
             self._unblock_wm_close()
+    def _set_window_controls_disabled(self, header, disabled):
+        """Set window controls in a header bar to invisible+non-interactive (keeping allocation) or restore them."""
+        for wc in self._find_window_controls(header):
+            wc.set_opacity(0.0 if disabled else 1.0)
+            wc.set_can_target(not disabled)
+
+    def _find_window_controls(self, widget):
+        """Recursively find all GtkWindowControls descendants of a widget."""
+        results = []
+        child = widget.get_first_child()
+        while child:
+            if isinstance(child, Gtk.WindowControls):
+                results.append(child)
+            results.extend(self._find_window_controls(child))
+            child = child.get_next_sibling()
+        return results
     def _block_wm_close(self):
         """Block window manager close actions."""
         if not hasattr(self, '_delete_handler_id'):
             self._delete_handler_id = self.connect('close-request', self._block_close_signal)
-        try:
-            self.set_modal(True)
-        except:
-            pass
     def _unblock_wm_close(self):
         """Restore normal window manager close behavior."""
         if hasattr(self, '_delete_handler_id'):
             self.disconnect(self._delete_handler_id)
             delattr(self, '_delete_handler_id')
-        try:
-            self.set_modal(False)
-        except:
-            pass
     def _block_close_signal(self, window):
         """Signal handler that blocks all close attempts."""
         return True  
@@ -618,6 +655,9 @@ class WidgetLoaderWindow(Adw.ApplicationWindow):
             self._build_sidebar()
             self._build_content_area()
             self.split_view = Adw.NavigationSplitView()
+            self.split_view.set_min_sidebar_width(SIDEBAR_WIDTH)
+            self.split_view.set_max_sidebar_width(SIDEBAR_WIDTH)
+            self.split_view.set_sidebar_width_fraction(0.25)
             self.split_view.set_sidebar(self.sidebar_page)
             self.split_view.set_content(self.content_page)
             self.set_content(self.split_view)
@@ -661,18 +701,49 @@ class WidgetLoaderWindow(Adw.ApplicationWindow):
         """Build the sidebar with widget list and optional window controls."""
         self.sidebar_page = Adw.NavigationPage()
         self.sidebar_page.set_title(_("Widgets"))
-        sidebar_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        sidebar_container.set_spacing(0)
-        sidebar_container.set_size_request(SIDEBAR_WIDTH, -1)
-        sidebar_container.set_hexpand(False)  
+        self.sidebar_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.sidebar_container.set_spacing(0)
+        self.sidebar_container.set_hexpand(True)
         header = self._create_sidebar_header()
-        sidebar_container.append(header)
+        self.sidebar_container.append(header)
         separator = self._create_invisible_separator()
-        sidebar_container.append(separator)
+        self.sidebar_container.append(separator)
         scrollable_area = self._create_scrollable_widget_list()
-        sidebar_container.append(scrollable_area)
+        self.sidebar_container.append(scrollable_area)
+        # Compact mode icon strip (initially hidden)
+        self._compact_strip = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._compact_strip.set_halign(Gtk.Align.CENTER)
+        self._compact_strip.set_valign(Gtk.Align.START)
+        self._compact_strip.set_vexpand(True)
+        self._compact_strip.set_visible(False)
+        self._compact_strip.set_margin_top(6)
+        self._compact_strip.set_margin_bottom(6)
+        compact_scroll = Gtk.ScrolledWindow()
+        compact_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        compact_scroll.set_vexpand(True)
+        compact_scroll.set_child(self._compact_strip)
+        self.sidebar_container.append(compact_scroll)
+        self._compact_scroll = compact_scroll
+        self._compact_scroll.set_visible(False)
+        # Compact mode toggle button at the bottom
+        self._compact_toggle_btn = Gtk.Button()
+        self._compact_toggle_btn.set_icon_name("sidebar-show-symbolic")
+        self._compact_toggle_btn.add_css_class("flat")
+        self._compact_toggle_btn.add_css_class("compact-toggle-btn")
+        self._compact_toggle_btn.set_halign(Gtk.Align.CENTER)
+        self._compact_toggle_btn.set_margin_bottom(16)
+        self._compact_toggle_btn.set_margin_top(4)
+        self._compact_toggle_btn.set_tooltip_text(_("Toggle compact mode"))
+        self._compact_toggle_btn.connect("clicked", self._on_compact_toggle_clicked)
+        # Apply initial rotation CSS (180 degrees for normal mode)
+        self._btn_css_provider = Gtk.CssProvider()
+        self._btn_css_provider.load_from_data(b".compact-toggle-btn { transition: none; transform: rotate(180deg); }")
+        self._compact_toggle_btn.get_style_context().add_provider(
+            self._btn_css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1
+        )
+        self.sidebar_container.append(self._compact_toggle_btn)
         self._setup_sidebar_context_menu()
-        self.sidebar_page.set_child(sidebar_container)
+        self.sidebar_page.set_child(self.sidebar_container)
     def _setup_sidebar_context_menu(self):
         menu = Gio.Menu()
         item = Gio.MenuItem.new(_("Create a shortcut"), "win.create_shortcut")
@@ -886,6 +957,7 @@ Hidden=false
         header.add_css_class("flat")
         title = Gtk.Label(label=_("Linexin Center (UNSTABLE)"))
         title.add_css_class("heading")
+        self._sidebar_header_title = title
         header.set_title_widget(title)
         left_buttons, right_buttons = self._parse_button_layout()
         if left_buttons:
@@ -913,6 +985,7 @@ Hidden=false
         container.set_margin_start(6)
         container.set_margin_end(6)
         container.append(scrolled_window)
+        self._widget_list_container = container
         return container
     def _build_content_area(self):
         """Build the content area with draggable header and widget display."""
@@ -1239,6 +1312,20 @@ Hidden=false
         icon = self._load_widget_icon(icon_path)
         row.add_prefix(icon)
         self.widget_list.append(row)
+        self._sidebar_rows.append(row)
+        # Also add a compact icon button
+        compact_btn = Gtk.Button()
+        compact_btn.add_css_class("flat")
+        compact_btn.add_css_class("compact-icon-btn")
+        compact_btn.set_halign(Gtk.Align.CENTER)
+        compact_btn.set_tooltip_text(display_name)
+        compact_btn.widget_name = widget_name
+        compact_icon = self._load_widget_icon(icon_path)
+        compact_btn.set_child(compact_icon)
+        compact_btn.connect("clicked", self._on_compact_icon_clicked)
+        if hasattr(self, '_compact_strip'):
+            self._compact_strip.append(compact_btn)
+        self._compact_icon_buttons.append(compact_btn)
     def _load_widget_icon(self, icon_path):
         """Load an icon from a file path or return default icon."""
         if not icon_path or not os.path.exists(icon_path):
@@ -1320,6 +1407,8 @@ Hidden=false
         self._start_translation_monitoring()
         display_name = row.display_name if hasattr(row, 'display_name') else widget_name
         self.content_page.set_title(display_name)
+        if self._compact_mode:
+            self._update_compact_selection(widget_name)
         self.selection_timeout_id = None
         return False
     def _generate_stack_page_name(self, filename_or_widget_name):
@@ -1492,6 +1581,168 @@ Hidden=false
                 pass
         except Exception:
             pass  
+    def _apply_saved_compact(self):
+        """Apply saved compact mode on startup (no animation)."""
+        self._set_compact_mode(True, animated=False)
+        return False
+
+    def _on_compact_toggle_clicked(self, button):
+        """Handle manual compact mode toggle button click."""
+        new_compact = not self._compact_mode
+        self._set_compact_mode(new_compact, animated=True)
+        config = _load_config()
+        config["compact_mode"] = new_compact
+        _save_config(config)
+
+    def _on_compact_icon_clicked(self, button):
+        """Handle click on a compact mode icon to select the corresponding widget."""
+        widget_name = button.widget_name
+        # Find the corresponding row in the normal list and activate it
+        row = self.widget_list.get_first_child()
+        while row:
+            if hasattr(row, 'widget_name') and row.widget_name == widget_name:
+                self.widget_list.select_row(row)
+                self._on_widget_selected(self.widget_list, row)
+                break
+            row = row.get_next_sibling()
+        # Update compact icon selection styling
+        self._update_compact_selection(widget_name)
+
+    def _update_compact_selection(self, selected_name):
+        """Update visual selection state of compact icon buttons."""
+        for btn in self._compact_icon_buttons:
+            if btn.widget_name == selected_name:
+                btn.add_css_class("compact-icon-selected")
+            else:
+                btn.remove_css_class("compact-icon-selected")
+
+    def _set_compact_mode(self, compact, animated=True):
+        """Switch between compact and normal sidebar modes."""
+        if self._compact_mode == compact:
+            return
+        self._compact_mode = compact
+        if compact:
+            self._transition_to_compact(animated)
+        else:
+            self._transition_to_normal(animated)
+
+    def _apply_sidebar_width(self, w):
+        """Set the split view sidebar to exactly w pixels."""
+        self.split_view.set_min_sidebar_width(w)
+        self.split_view.set_max_sidebar_width(w)
+
+    def _animate_toggle_button(self, target_deg, animated):
+        """Animate the compact toggle button rotation to target_deg."""
+        if self._btn_rotate_anim is not None:
+            self._btn_rotate_anim.skip()
+            self._btn_rotate_anim = None
+        if not animated:
+            self._btn_rotation_deg = target_deg
+            self._apply_btn_rotation(target_deg)
+            return
+        start_deg = self._btn_rotation_deg
+        def _on_tick(v):
+            self._btn_rotation_deg = v
+            self._apply_btn_rotation(v)
+        target = Adw.CallbackAnimationTarget.new(_on_tick)
+        anim = Adw.TimedAnimation.new(
+            self._compact_toggle_btn,
+            float(start_deg),
+            float(target_deg),
+            COMPACT_ANIM_DURATION,
+            target
+        )
+        anim.set_easing(Adw.Easing.EASE_IN_OUT_CUBIC)
+        self._btn_rotate_anim = anim
+        anim.play()
+
+    def _apply_btn_rotation(self, deg):
+        """Apply rotation transform to the toggle button via CSS."""
+        css = f".compact-toggle-btn {{ transition: none; transform: rotate({deg}deg); }}"
+        self._btn_css_provider.load_from_data(css.encode())
+
+    def _transition_to_compact(self, animated):
+        """Animate transition to compact mode."""
+        selected = self.widget_list.get_selected_row()
+        if selected and hasattr(selected, 'widget_name'):
+            self._update_compact_selection(selected.widget_name)
+        self._animate_toggle_button(0.0, animated)
+
+        def _swap_to_compact():
+            if hasattr(self, '_sidebar_header_title'):
+                self._sidebar_header_title.set_visible(False)
+            self._widget_list_container.set_visible(False)
+            self._compact_scroll.set_visible(True)
+            self._compact_strip.set_visible(True)
+
+        if animated:
+            if self._sidebar_anim is not None:
+                self._sidebar_anim.skip()
+                self._sidebar_anim = None
+            # Swap content at the midpoint of the width animation
+            mid = (SIDEBAR_WIDTH + SIDEBAR_COMPACT_WIDTH) / 2.0
+            swapped = [False]
+            def _on_tick(v):
+                self._apply_sidebar_width(int(v))
+                if not swapped[0] and v <= mid:
+                    swapped[0] = True
+                    _swap_to_compact()
+            target = Adw.CallbackAnimationTarget.new(_on_tick)
+            anim = Adw.TimedAnimation.new(
+                self.split_view,
+                float(SIDEBAR_WIDTH),
+                float(SIDEBAR_COMPACT_WIDTH),
+                COMPACT_ANIM_DURATION,
+                target
+            )
+            anim.set_easing(Adw.Easing.EASE_IN_OUT_CUBIC)
+            self._sidebar_anim = anim
+            anim.play()
+        else:
+            _swap_to_compact()
+            self._apply_sidebar_width(SIDEBAR_COMPACT_WIDTH)
+
+    def _transition_to_normal(self, animated):
+        """Animate transition to normal mode."""
+        self._animate_toggle_button(180.0, animated)
+
+        def _swap_to_normal():
+            if hasattr(self, '_sidebar_header_title'):
+                self._sidebar_header_title.set_visible(True)
+            self._widget_list_container.set_visible(True)
+            self._compact_scroll.set_visible(False)
+            self._compact_strip.set_visible(False)
+
+        if animated:
+            if self._sidebar_anim is not None:
+                self._sidebar_anim.skip()
+                self._sidebar_anim = None
+            # Swap content at the midpoint of the width animation
+            mid = (SIDEBAR_WIDTH + SIDEBAR_COMPACT_WIDTH) / 2.0
+            swapped = [False]
+            def _on_tick(v):
+                self._apply_sidebar_width(int(v))
+                if not swapped[0] and v >= mid:
+                    swapped[0] = True
+                    _swap_to_normal()
+            def _on_done(anim):
+                self._sidebar_anim = None
+            target = Adw.CallbackAnimationTarget.new(_on_tick)
+            anim = Adw.TimedAnimation.new(
+                self.split_view,
+                float(SIDEBAR_COMPACT_WIDTH),
+                float(SIDEBAR_WIDTH),
+                COMPACT_ANIM_DURATION,
+                target
+            )
+            anim.set_easing(Adw.Easing.EASE_IN_OUT_CUBIC)
+            anim.connect("done", _on_done)
+            self._sidebar_anim = anim
+            anim.play()
+        else:
+            self._apply_sidebar_width(SIDEBAR_WIDTH)
+            _swap_to_normal()
+
     def _on_button_layout_changed(self, settings, key):
         """Handle changes to window button layout from GNOME settings."""
         self.current_button_layout = settings.get_string("button-layout")
@@ -1507,10 +1758,23 @@ Hidden=false
         current_content = self.content_display.get_child()
         if self.widget_list.get_parent():
             self.widget_list.get_parent().set_child(None)
+        # Detach compact icon buttons from old strip
+        for btn in self._compact_icon_buttons:
+            parent = btn.get_parent()
+            if parent:
+                parent.remove(btn)
         if self.content_display.get_parent():
             self.content_display.get_parent().remove(self.content_display)
+        was_compact = self._compact_mode
         self._build_sidebar()
         self._build_content_area()
+        # Re-add compact icon buttons to new strip
+        for btn in self._compact_icon_buttons:
+            self._compact_strip.append(btn)
+        # Restore compact state
+        if was_compact:
+            self._compact_mode = False
+            self._set_compact_mode(True, animated=False)
         self.split_view.set_sidebar(self.sidebar_page)
         self.split_view.set_content(self.content_page)
         if current_content:
@@ -1579,13 +1843,32 @@ Hidden=false
             .command-locked {
                 background: alpha(@warning_color, 0.1);
             }
-            /* Window controls opacity during command lock */
-            .command-locked-controls windowcontrols {
-                opacity: 0;
+            /* Compact mode icon button */
+            .compact-icon-btn {
+                min-width: 40px;
+                min-height: 40px;
+                padding: 6px;
+                border-radius: 10px;
+                margin: 2px 2px;
             }
-            .command-locked-controls windowcontrols button {
-                opacity: 0;
-            }           
+            .compact-icon-btn:hover {
+                background: alpha(@accent_color, 0.15);
+            }
+            .compact-icon-selected {
+                background: alpha(@accent_color, 0.25);
+            }
+            .compact-icon-selected:hover {
+                background: alpha(@accent_color, 0.35);
+            }
+            /* Compact toggle button */
+            .compact-toggle-btn {
+                min-width: 32px;
+                min-height: 32px;
+                border-radius: 50%;
+            }
+            .compact-toggle-btn image {
+                transition: none;
+            }
         """
         css_provider = Gtk.CssProvider()
         css_provider.load_from_data(css.encode())
