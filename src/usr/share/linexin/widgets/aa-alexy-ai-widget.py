@@ -1546,6 +1546,37 @@ class LinexinAISysadminWidget(Gtk.Box):
             self.add_message_bubble("assistant", _(f"Failed to start mic: {e}"))
             btn.set_active(False)
 
+    @staticmethod
+    def _kill_hey_linux():
+        """Kill any running hey-linux daemon.  Uses os.system to bypass
+        the monkey-patched subprocess lock manager, and the bracket trick
+        so pkill/shell don't self-match."""
+        os.system("pkill -9 -f '[/]usr/bin/hey-linux' 2>/dev/null")
+        os.system("pkill -9 -f '[h]ey-linux-venv/bin/python' 2>/dev/null")
+
+    @staticmethod
+    def _launch_hey_linux_detached():
+        """Launch hey-linux fully detached via double-fork so the lock
+        manager is never involved and the window can still close."""
+        pid = os.fork()
+        if pid == 0:
+            # First child — new session leader
+            os.setsid()
+            pid2 = os.fork()
+            if pid2 > 0:
+                os._exit(0)  # First child exits; grandchild reparented to init
+            # Grandchild — redirect all I/O and exec hey-linux
+            devnull_fd = os.open(os.devnull, os.O_RDWR)
+            os.dup2(devnull_fd, 0)
+            os.dup2(devnull_fd, 1)
+            os.dup2(devnull_fd, 2)
+            if devnull_fd > 2:
+                os.close(devnull_fd)
+            os.execvp("/usr/bin/hey-linux", ["/usr/bin/hey-linux"])
+            os._exit(1)
+        else:
+            os.waitpid(pid, 0)  # Reap first child immediately
+
     def _on_hey_linux_toggled(self, row, param):
         self.hey_linux_enabled = row.get_active()
         self.save_config()
@@ -1556,14 +1587,14 @@ class LinexinAISysadminWidget(Gtk.Box):
         if self.hey_linux_enabled:
             os.makedirs(autostart_dir, exist_ok=True)
             with open(desktop_file, "w") as f:
-                f.write("[Desktop Entry]\nName=Hey Linux Wake Word\nExec=/usr/bin/hey-linux\nType=Application\nNoDisplay=true\n")
+                f.write("[Desktop Entry]\nName=Hey Alexy Wake Word\nExec=/usr/bin/hey-linux\nType=Application\nNoDisplay=true\n")
             
-            subprocess.run(["pkill", "-f", "/usr/bin/hey-linux"])
-            subprocess.Popen(["/usr/bin/hey-linux"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            self._kill_hey_linux()
+            self._launch_hey_linux_detached()
         else:
             if os.path.exists(desktop_file):
                 os.unlink(desktop_file)
-            subprocess.run(["pkill", "-f", "/usr/bin/hey-linux"])
+            self._kill_hey_linux()
 
     def _stt_start_vosk(self, btn):
         """Start Vosk-based speech-to-text (streaming recognition)."""
@@ -2131,14 +2162,14 @@ class LinexinAISysadminWidget(Gtk.Box):
         stt_backend_row.connect("notify::selected", sync_stt_visibility)
         sync_stt_visibility()  # apply initial state
 
-        # --- Hey Linux Daemon ---
+        # --- Hey Alexy Daemon ---
         hey_linux_group = Adw.PreferencesGroup(
-            title=_("Hey Linux Wake Word"), 
-            description=_("Continuously listens for 'Hey Linux' to activate the assistant. Uses Vosk lightweight STT.")
+            title=_("Hey Alexy Wake Word"), 
+            description=_("Continuously listens for 'Hey Alexy' to activate the assistant. Uses openWakeWord for lightweight wake word detection.")
         )
         page_speech.add(hey_linux_group)
 
-        self.hey_linux_row = Adw.SwitchRow(title=_("Enable Wake Word Daemon"))
+        self.hey_linux_row = Adw.SwitchRow(title=_('Enable "Hey Alexy"'))
         self.hey_linux_row.set_active(self.hey_linux_enabled)
         self.hey_linux_row.connect("notify::active", self._on_hey_linux_toggled)
         hey_linux_group.add(self.hey_linux_row)
