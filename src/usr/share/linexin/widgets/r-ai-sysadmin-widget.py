@@ -510,7 +510,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             self.widgeticon = self.alexy_icon_path
         else:
             self.widgeticon = "utilities-terminal-symbolic"
-        self.set_margin_top(12)
+        self.set_margin_top(4)
         self.set_margin_bottom(50)
         self.set_margin_start(50)
         self.set_margin_end(50)
@@ -571,10 +571,14 @@ class LinexinAISysadminWidget(Gtk.Box):
         
         self.load_config()
         self._load_theme()
+
+        # Flush pending GTK events so the loading spinner keeps animating
+        # and the window stays responsive (closeable) during setup_ui.
+        ctx = GLib.MainContext.default()
+        while ctx.pending():
+            ctx.iteration(False)
+
         self.setup_ui()
-        
-        if self.hide_sidebar and self.window:
-            GLib.idle_add(self.resize_window_deferred)
 
         # Auto-activate voice input if launched with --voice flag
         if voice_autostart:
@@ -1078,7 +1082,7 @@ class LinexinAISysadminWidget(Gtk.Box):
     def setup_ui(self):
         # Header
         header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        header_box.set_margin_bottom(20)
+        header_box.set_margin_bottom(8)
         
         header_svg = self._get_theme_svg("header-icon.svg")
         if header_svg:
@@ -1087,7 +1091,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             system_icon = Gtk.Image.new_from_file(self.alexy_icon_path)
         else:
             system_icon = Gtk.Image.new_from_icon_name("system-run-symbolic")
-        system_icon.set_pixel_size(100)
+        system_icon.set_pixel_size(64)
         self.header_icon_widget = system_icon
         header_box.append(system_icon)
         
@@ -1268,17 +1272,14 @@ class LinexinAISysadminWidget(Gtk.Box):
 
     def _check_stt_availability(self):
         """Check if the selected STT backend is available and update mic button state."""
+        import importlib.util as _ilu
         if self.stt_backend == "whisper":
-            try:
-                import whisper # type: ignore # pylint: disable=import-error # noqa: F401
-            except ImportError:
+            if _ilu.find_spec("whisper") is None:
                 self.stt_toggle.set_sensitive(False)
                 self.stt_toggle.set_tooltip_text(_("openai-whisper is not installed. Install it via: pip install openai-whisper"))
                 return
         elif self.stt_backend == "vosk":
-            try:
-                import vosk # type: ignore # pylint: disable=import-error # noqa: F401
-            except ImportError:
+            if _ilu.find_spec("vosk") is None:
                 self.stt_toggle.set_sensitive(False)
                 self.stt_toggle.set_tooltip_text(_("python-vosk is not installed. You can install it from Settings."))
                 return
@@ -1306,17 +1307,28 @@ class LinexinAISysadminWidget(Gtk.Box):
                 proc.terminate() # type: ignore
                 self.arecord_proc = None
 
+    def _play_activation_sound(self):
+        """Play the activation sound when STT starts listening."""
+        sound_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds", "alexy_activation.ogg")
+        if not os.path.isfile(sound_path):
+            sound_path = "/usr/share/linexin/widgets/sounds/alexy_activation.ogg"
+        if os.path.isfile(sound_path):
+            subprocess.Popen(
+                ["paplay", sound_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
     def _stt_start_whisper(self, btn):
         """Start Whisper-based speech-to-text: record audio, then transcribe on silence."""
-        import struct, wave
-        try:
-            import whisper as whisper_module # type: ignore # pylint: disable=import-error
-        except ImportError:
-            self.add_message_bubble("assistant", _("openai-whisper is not installed."))
-            btn.set_active(False)
+        # If model is already loaded from a previous invocation, skip straight
+        # to recording — no import or load needed.
+        if hasattr(self, '_whisper_model_obj') and getattr(self, '_whisper_model_name', None) == self.whisper_model:
+            self._begin_whisper_recording(btn)
             return
 
-        # Check if the Whisper model needs to be downloaded first
+        # Check if the model file needs to be downloaded first (lightweight
+        # path check — no heavy imports needed).
         whisper_cache = os.path.expanduser("~/.cache/whisper")
         model_file = os.path.join(whisper_cache, f"{self.whisper_model}.pt")
         if not os.path.exists(model_file):
@@ -1380,18 +1392,48 @@ class LinexinAISysadminWidget(Gtk.Box):
             win.present()
             return
 
-        # Load or reuse the Whisper model
-        if not hasattr(self, '_whisper_model_obj') or getattr(self, '_whisper_model_name', None) != self.whisper_model:
-            try:
-                self.entry.set_placeholder_text(_("Loading Whisper model..."))
-                self._whisper_model_obj = whisper_module.load_model(self.whisper_model)
-                self._whisper_model_name = self.whisper_model
-            except Exception as e:
-                self.add_message_bubble("assistant", _(f"Error loading Whisper model: {e}"))
-                btn.set_active(False)
-                return
+        # Import whisper + load model entirely in a background thread so
+        # neither `import whisper` (which pulls in PyTorch) nor load_model()
+        # block the GTK main loop.
+        self.entry.set_placeholder_text(_("Loading Whisper model..."))
+        self.stt_toggle.set_sensitive(False)
 
+        def _bg_import_and_load():
+            try:
+                import whisper as whisper_module # type: ignore # pylint: disable=import-error
+                model_obj = whisper_module.load_model(self.whisper_model)
+                GLib.idle_add(self._on_whisper_model_ready, model_obj, btn)
+            except ImportError:
+                GLib.idle_add(self._on_whisper_model_failed, "openai-whisper is not installed.", btn)
+            except Exception as e:
+                GLib.idle_add(self._on_whisper_model_failed, str(e), btn)
+
+        threading.Thread(target=_bg_import_and_load, daemon=True).start()
+
+    def _on_whisper_model_ready(self, model_obj, btn):
+        """Called on main thread after background whisper model load succeeds."""
+        self._whisper_model_obj = model_obj
+        self._whisper_model_name = self.whisper_model
+        self.stt_toggle.set_sensitive(True)
+        if btn.get_active():
+            self._begin_whisper_recording(btn)
+        else:
+            self.entry.set_placeholder_text(_("Ask a question..."))
+        return False
+
+    def _on_whisper_model_failed(self, error_msg, btn):
+        """Called on main thread after background whisper model load fails."""
+        self.stt_toggle.set_sensitive(True)
+        self.add_message_bubble("assistant", _("Error loading Whisper model: ") + error_msg)
+        btn.set_active(False)
+        self.entry.set_placeholder_text(_("Ask a question..."))
+        return False
+
+    def _begin_whisper_recording(self, btn):
+        """Start arecord and the whisper listen loop (model already loaded)."""
+        import struct, wave
         self.entry.set_placeholder_text(_("Listening..."))
+        self._play_activation_sound()
 
         try:
             self.arecord_proc = subprocess.Popen(
@@ -1517,29 +1559,7 @@ class LinexinAISysadminWidget(Gtk.Box):
                 f.write("[Desktop Entry]\nName=Hey Linux Wake Word\nExec=/usr/bin/hey-linux\nType=Application\nNoDisplay=true\n")
             
             subprocess.run(["pkill", "-f", "/usr/bin/hey-linux"])
-            
-            model_path = os.path.expanduser(f"~/.cache/linexin/vosk-model-{self.vosk_lang}")
-            if not os.path.exists(model_path):
-                # Download model then start
-                url = f"https://alphacephei.com/vosk/models/vosk-model-{self.vosk_lang}.zip"
-                cmd_str = f"mkdir -p ~/.cache/linexin && rm -rf /tmp/vmodel && unzip -q -o /tmp/vmodel.zip -d /tmp/vmodel/ && mv /tmp/vmodel/* {model_path} && rm -rf /tmp/vmodel /tmp/vmodel.zip"
-                full_cmd_str = f"curl -L {url} -o /tmp/vmodel.zip && {cmd_str}"
-
-                win = _ActionProgressWindow(
-                    parent=self.window if self.window else self.get_root(),
-                    title=_("Downloading Wake Word Model"),
-                    cmd_string=full_cmd_str,
-                    poll_auth_file=False
-                )
-                def on_download_done(success):
-                    if success:
-                        subprocess.Popen(["/usr/bin/hey-linux"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-                    else:
-                        row.set_active(False)
-                win.on_close_callback = on_download_done
-                win.present()
-            else:
-                subprocess.Popen(["/usr/bin/hey-linux"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            subprocess.Popen(["/usr/bin/hey-linux"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         else:
             if os.path.exists(desktop_file):
                 os.unlink(desktop_file)
@@ -1547,11 +1567,11 @@ class LinexinAISysadminWidget(Gtk.Box):
 
     def _stt_start_vosk(self, btn):
         """Start Vosk-based speech-to-text (streaming recognition)."""
-        model_path = os.path.expanduser(f"~/.cache/linexin/vosk-model-{self.vosk_lang}")
+        model_path = os.path.expanduser(f"~/.local/share/linexin/vosk-model-{self.vosk_lang}")
         if not os.path.exists(model_path):
             btn.set_active(False)
             url = f"https://alphacephei.com/vosk/models/vosk-model-{self.vosk_lang}.zip"
-            cmd_str = f"mkdir -p ~/.cache/linexin && rm -rf /tmp/vmodel && unzip -q -o /tmp/vmodel.zip -d /tmp/vmodel/ && mv /tmp/vmodel/* {model_path} && rm -rf /tmp/vmodel /tmp/vmodel.zip"
+            cmd_str = f"mkdir -p ~/.local/share/linexin && rm -rf /tmp/vmodel && unzip -q -o /tmp/vmodel.zip -d /tmp/vmodel/ && mv /tmp/vmodel/* {model_path} && rm -rf /tmp/vmodel /tmp/vmodel.zip"
 
             # Fetch first then extract to ensure curl progress shows correctly
             full_cmd_str = f"curl -L {url} -o /tmp/vmodel.zip && {cmd_str}"
@@ -1589,6 +1609,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             return
 
         self.entry.set_placeholder_text(_("Listening..."))
+        self._play_activation_sound()
 
         try:
             self.arecord_proc = subprocess.Popen(
@@ -3363,8 +3384,8 @@ class LinexinAISysadminWidget(Gtk.Box):
             GLib.timeout_add(100, run_espeak)
             return
             
-        piper_bin = os.path.expanduser("~/.cache/linexin/piper/piper")
-        model_file = os.path.expanduser(f"~/.cache/linexin/piper-models/{model_name}.onnx")
+        piper_bin = os.path.expanduser("~/.local/share/linexin/piper/piper")
+        model_file = os.path.expanduser(f"~/.local/share/linexin/piper-models/{model_name}.onnx")
         
         def run_piper():
             escaped_text = shlex.quote(clean_text)
@@ -3386,10 +3407,10 @@ class LinexinAISysadminWidget(Gtk.Box):
         needs_model = not os.path.exists(model_file)
         
         if needs_piper or needs_model:
-            cmds = ["mkdir -p ~/.cache/linexin/piper ~/.cache/linexin/piper-models"]
+            cmds = ["mkdir -p ~/.local/share/linexin/piper ~/.local/share/linexin/piper-models"]
             if needs_piper:
                 cmds.append("curl -sL https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz -o /tmp/piper.tar.gz")
-                cmds.append("tar -xzf /tmp/piper.tar.gz -C ~/.cache/linexin/")
+                cmds.append("tar -xzf /tmp/piper.tar.gz -C ~/.local/share/linexin/")
                 cmds.append("rm -f /tmp/piper.tar.gz")
             if needs_model:
                 base_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{model_path}/{model_name}.onnx"

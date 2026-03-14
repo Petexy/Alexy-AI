@@ -2,9 +2,8 @@
 """
 hey-linux — Wake word listener daemon for Linexin AI Sysadmin.
 
-Continuously listens for the phrase "Hey Linux" using Vosk,
-then launches the AI Sysadmin widget asynchronously with voice-to-text
-automatically active.
+Uses openWakeWord for lightweight wake word detection, then
+launches the AI Sysadmin widget with voice-to-text active.
 
 Usage:
     hey-linux
@@ -15,41 +14,88 @@ import sys
 import json
 import signal
 import subprocess
+import shutil
 import time
 import argparse
+import venv
 
 CONFIG_DIR = os.path.expanduser("~/.config/linexin-center")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "ai-sysadmin.json")
+MODEL_DIR = os.path.expanduser("~/.local/share/linexin/wakeword-models")
+VENV_DIR = os.path.expanduser("~/.local/share/linexin/hey-linux-venv")
 
-WAKE_PHRASES = [
-    "hey linux", "hey linex", "hey lynux", "hey lenux", "hey linuxin", "hey lennox",
-    "hail linux", "helly nux", "hello linux", "hi linux", "low linux", "hay linux",
-    "a linux", "i linux", "hey minix", "hey lino"
-]
 LINEXIN_CENTER = "linexin-center"
+
+SAMPLE_RATE = 16000
+CHUNK_SAMPLES = 1280
+CHUNK_BYTES = CHUNK_SAMPLES * 2
+DEFAULT_THRESHOLD = 0.5
+
+
+def _venv_python():
+    """Return the path to the venv's Python interpreter."""
+    return os.path.join(VENV_DIR, "bin", "python")
+
+
+def _is_running_in_venv():
+    """Check if we're already running inside our venv."""
+    return os.path.realpath(sys.executable).startswith(os.path.realpath(VENV_DIR))
+
+
+def ensure_venv():
+    """Create the venv and install openwakeword if needed, then re-exec into it."""
+    if _is_running_in_venv():
+        return  # Already in venv, nothing to do
+
+    venv_py = _venv_python()
+
+    if not os.path.isfile(venv_py):
+        print("[hey-linux] First run — creating virtual environment...")
+        venv.create(VENV_DIR, with_pip=True, system_site_packages=False)
+        print(f"[hey-linux] Venv created at {VENV_DIR}")
+        print("[hey-linux] Installing openwakeword (this may take a moment)...")
+        subprocess.check_call(
+            [venv_py, "-m", "pip", "install", "--quiet", "openwakeword"],
+        )
+        print("[hey-linux] openwakeword installed successfully.")
+
+    # Re-exec this script using the venv Python so all imports resolve from it
+    os.execv(venv_py, [venv_py] + [os.path.abspath(__file__)] + sys.argv[1:])
 
 
 def load_config():
-    """Load STT settings from the shared config file."""
+    """Load settings from the shared config file."""
     config = {
-        "vosk_lang": "small-en-us-0.15",
+        "wakeword_threshold": DEFAULT_THRESHOLD,
     }
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 saved = json.load(f)
-            if "vosk_lang" in saved:
-                config["vosk_lang"] = saved["vosk_lang"]
+            if "wakeword_threshold" in saved:
+                config["wakeword_threshold"] = float(saved["wakeword_threshold"])
         except Exception as e:
             print(f"[hey-linux] Warning: Could not read config: {e}")
     return config
 
 
-def listen_for_wake_word_vosk(vosk_recognizer):
-    """Listen continuously and block until wake word is detected."""
-    import json
-    SAMPLE_RATE = 16000
-    CHUNK_SIZE = 4000
+def find_wakeword_models():
+    """Find wake word model files in the model directory."""
+    models = []
+    if os.path.isdir(MODEL_DIR):
+        for f in sorted(os.listdir(MODEL_DIR)):
+            if f.endswith((".onnx", ".tflite")):
+                models.append(os.path.join(MODEL_DIR, f))
+    return models
+
+
+def listen_for_wake_word(oww_model, threshold):
+    """Listen for wake word using openWakeWord. Blocks until detected.
+    
+    Returns True as soon as the wake word is detected so the caller can
+    launch the assistant immediately.
+    """
+    import numpy as np  # type: ignore
 
     proc = subprocess.Popen(
         ["arecord", "-f", "S16_LE", "-c", "1", "-r", str(SAMPLE_RATE), "-q"],
@@ -64,27 +110,61 @@ def listen_for_wake_word_vosk(vosk_recognizer):
             stdout = proc.stdout
             if stdout is None:
                 break
-            data: bytes = stdout.read(CHUNK_SIZE)  # type: ignore
-            if not data:
+            data = stdout.read(CHUNK_BYTES)
+            if not data or len(data) < CHUNK_BYTES:
                 break
 
-            if vosk_recognizer.AcceptWaveform(data):
-                result = json.loads(vosk_recognizer.Result())
-                text = result.get("text", "").lower()
-            else:
-                partial = json.loads(vosk_recognizer.PartialResult())
-                text = partial.get("partial", "").lower()
+            audio = np.frombuffer(data, dtype=np.int16)
+            oww_model.predict(audio)
 
-            if text:
-                for phrase in WAKE_PHRASES:
-                    if phrase in text:
-                        print(f'[hey-linux] Wake word detected in: "{text}"')
-                        return True
+            for model_name in oww_model.prediction_buffer.keys():
+                scores = list(oww_model.prediction_buffer[model_name])
+                if scores and scores[-1] > threshold:
+                    print(f'[hey-linux] Wake word detected: "{model_name}" (score: {scores[-1]:.3f})')
+                    return True
     finally:
         proc.terminate()
         proc.wait()
 
     return False
+
+
+def debounce_wake_word(oww_model, threshold):
+    """Read audio until wake word scores drop, preventing re-triggers."""
+    import numpy as np  # type: ignore
+
+    proc = subprocess.Popen(
+        ["arecord", "-f", "S16_LE", "-c", "1", "-r", str(SAMPLE_RATE), "-q"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+
+    try:
+        while True:
+            if proc.poll() is not None:
+                break
+            stdout = proc.stdout
+            if stdout is None:
+                break
+            data = stdout.read(CHUNK_BYTES)
+            if not data or len(data) < CHUNK_BYTES:
+                break
+
+            audio = np.frombuffer(data, dtype=np.int16)
+            oww_model.predict(audio)
+
+            max_score = 0.0
+            for model_name in oww_model.prediction_buffer.keys():
+                scores = list(oww_model.prediction_buffer[model_name])
+                if scores:
+                    max_score = max(max_score, scores[-1])
+
+            if max_score < threshold * 0.3:
+                oww_model.reset()
+                return
+    finally:
+        proc.terminate()
+        proc.wait()
 
 
 def send_notification(title, body):
@@ -100,13 +180,11 @@ def send_notification(title, body):
 
 
 def launch_widget():
-    """Launch linexin-center asynchronously."""
-    import shutil
-    # Try to find linexin-center: first in PATH, then relative to this script
+    """Launch linexin-center asynchronously. Returns the Popen object."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
-        shutil.which(LINEXIN_CENTER),  # system PATH (resolved to full path)
-        os.path.join(script_dir, LINEXIN_CENTER),  # same directory
+        shutil.which(LINEXIN_CENTER),
+        os.path.join(script_dir, LINEXIN_CENTER),
     ]
 
     cmd = None
@@ -117,15 +195,13 @@ def launch_widget():
 
     if cmd is None:
         print(f"[hey-linux] Error: Could not find {LINEXIN_CENTER}")
-        return
+        return None
 
-    # Set env var so linexin-center opens as a new independent instance
-    # instead of re-activating an existing one (which would ignore our args).
     env = os.environ.copy()
     env["LINEXIN_NEW_INSTANCE"] = "1"
 
     print(f"[hey-linux] Launching: {cmd} -w r-ai-sysadmin-widget --voice")
-    subprocess.Popen(
+    return subprocess.Popen(
         [cmd, "-w", "r-ai-sysadmin-widget", "--voice"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -140,10 +216,14 @@ def main():
     )
     parser.parse_args()
 
-    config = load_config()
-    vosk_lang = config["vosk_lang"]
+    # Bootstrap: create venv + install openwakeword on first run, then re-exec
+    ensure_venv()
 
-    # Handle clean shutdown
+    from openwakeword.model import Model as OWWModel  # type: ignore
+
+    config = load_config()
+    threshold = config["wakeword_threshold"]
+
     running = True
 
     def signal_handler(sig, frame):
@@ -154,34 +234,39 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    print(f"[hey-linux] Starting wake word listener (backend: vosk)")
-    print(f"[hey-linux] Say \"Hey Linux\" to activate the AI assistant.")
+    print("[hey-linux] Starting wake word listener (backend: openWakeWord)")
+    print('[hey-linux] Say "Hey Linux" to activate the AI assistant.')
 
-    # Initialize the STT engine
-    try:
-        import vosk  # type: ignore
-    except ImportError:
-        print("[hey-linux] Error: python-vosk is not installed.")
-        print("[hey-linux] Install it with: pkexec pacman -S python-vosk")
-        sys.exit(1)
+    custom_models = find_wakeword_models()
+    if custom_models:
+        print(f"[hey-linux] Loading custom model(s): {[os.path.basename(m) for m in custom_models]}")
+        oww_model = OWWModel(wakeword_model_paths=custom_models)
+    else:
+        print(f"[hey-linux] No custom models in {MODEL_DIR}, using built-in openWakeWord models.")
+        print("[hey-linux] Place .onnx/.tflite wake word models in that directory for custom wake words.")
+        oww_model = OWWModel()
 
-    vosk.SetLogLevel(-1)
-    model_path = os.path.expanduser(f"~/.cache/linexin/vosk-model-{vosk_lang}")
-    if not os.path.exists(model_path):
-        print(f"[hey-linux] Error: Vosk model not found at {model_path}")
-        print("[hey-linux] Please open the AI Sysadmin widget and click the mic button to download it first.")
-        sys.exit(1)
+    model_names = list(oww_model.prediction_buffer.keys())
+    print(f"[hey-linux] Active models: {model_names}")
+    print(f"[hey-linux] Detection threshold: {threshold}")
+    print("[hey-linux] Listening for wake word...")
 
-    print(f"[hey-linux] Loading Vosk model from {model_path}...")
-    vosk_model = vosk.Model(model_path)
-    print("[hey-linux] Model loaded. Listening for wake word...")
+    launched_proc = None
 
     while running:
         try:
-            recognizer = vosk.KaldiRecognizer(vosk_model, 16000)
-            if listen_for_wake_word_vosk(recognizer):
-                send_notification("Hey Linux", "Activating AI assistant...")
-                launch_widget()
+            if listen_for_wake_word(oww_model, threshold):
+                # Only launch if the previously launched instance is no longer running
+                if launched_proc is not None and launched_proc.poll() is None:
+                    print("[hey-linux] Linexin Center is already running, ignoring.")
+                else:
+                    send_notification("Hey Linux", "Activating AI assistant...")
+                    launched_proc = launch_widget()
+
+                # Debounce: wait for scores to drop so the same
+                # utterance doesn't trigger a second detection
+                debounce_wake_word(oww_model, threshold)
+
                 if running:
                     print("[hey-linux] Resuming listening...")
         except Exception as e:

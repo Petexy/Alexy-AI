@@ -509,7 +509,10 @@ class WidgetLoaderWindow(Adw.ApplicationWindow):
         self.voice_autostart = voice_autostart
         self.l10n = get_localization_manager()
         self.set_title(_("Linexin Center"))
-        self.set_default_size(1280, 730)
+        if self.hide_sidebar:
+            self.set_default_size(800, 600)
+        else:
+            self.set_default_size(1280, 730)
         self.loaded_widgets: Dict[str, Any] = {}      
         self.widget_metadata: Dict[str, Dict[str, Any]] = {}     
         self.widget_order: list[str] = []          
@@ -528,7 +531,10 @@ class WidgetLoaderWindow(Adw.ApplicationWindow):
         self.is_command_locked = False
         self._setup_button_layout_monitoring()
         self._build_ui()
-        self._load_all_widgets()
+        if self.hide_sidebar and self.target_widget:
+            GLib.timeout_add(50, self._staged_load_step1)
+        else:
+            self._load_all_widgets()
     def resize_window(self, width, height):
         """Custom resize method that tries different approaches"""
         try:
@@ -608,7 +614,6 @@ class WidgetLoaderWindow(Adw.ApplicationWindow):
             self._build_content_area()
             self.set_content(self.content_page)
             self.set_resizable(True)
-            self.set_size_request(1, 1) 
         else:
             self._build_sidebar()
             self._build_content_area()
@@ -624,10 +629,25 @@ class WidgetLoaderWindow(Adw.ApplicationWindow):
         self.widget_stack.set_transition_duration(300)  
         self.widget_stack.set_hexpand(True)
         self.widget_stack.set_vexpand(True)
-        placeholder = Gtk.Label(label=_("Select a widget from the sidebar"))
-        placeholder.set_vexpand(True)
-        placeholder.set_hexpand(True)
-        self.widget_stack.add_named(placeholder, "placeholder")
+        if self.hide_sidebar and self.target_widget:
+            loading_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            loading_box.set_valign(Gtk.Align.CENTER)
+            loading_box.set_halign(Gtk.Align.CENTER)
+            loading_spinner = Gtk.Spinner()
+            loading_spinner.set_size_request(32, 32)
+            loading_spinner.start()
+            loading_box.append(loading_spinner)
+            loading_label = Gtk.Label(label=_("Loading..."))
+            loading_label.add_css_class("dim-label")
+            loading_box.append(loading_label)
+            loading_box.set_vexpand(True)
+            loading_box.set_hexpand(True)
+            self.widget_stack.add_named(loading_box, "placeholder")
+        else:
+            placeholder = Gtk.Label(label=_("Select a widget from the sidebar"))
+            placeholder.set_vexpand(True)
+            placeholder.set_hexpand(True)
+            self.widget_stack.add_named(placeholder, "placeholder")
         self.widget_stack.set_visible_child_name("placeholder")
         self.content_display = Adw.Bin()
         self.content_display.set_hexpand(True)
@@ -946,6 +966,63 @@ Hidden=false
             self._select_target_widget()
         elif not self.hide_sidebar:
             self._auto_select_first_widget()
+    def _staged_load_step1(self):
+        """Stage 1: Find target file, then load module in a background thread."""
+        target_normalized = self.target_widget.lower().replace('-', '_').replace(' ', '_')
+        if not target_normalized.endswith('.py'):
+            target_normalized += '.py'
+        if not os.path.exists(WIDGET_DIRECTORY):
+            return False
+        python_files = [f for f in os.listdir(WIDGET_DIRECTORY) if f.endswith(".py")]
+        target_file = None
+        for filename in python_files:
+            filename_normalized = filename.lower().replace('-', '_').replace(' ', '_')
+            if (filename_normalized == target_normalized or
+                filename.lower() == self.target_widget.lower() or
+                filename.lower() == self.target_widget.lower() + '.py'):
+                target_file = filename
+                break
+        if not target_file:
+            print(f"Target widget file not found: {self.target_widget}")
+            return False
+        target_filepath = os.path.join(WIDGET_DIRECTORY, target_file)
+        target_module_name = target_file[:-3]
+        print(f"Loading target widget (threaded): {target_file}")
+        # Run the heavy exec_module in a background thread so the GTK main
+        # loop keeps processing redraws (spinner) and input (close button).
+        def _bg_import():
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    target_module_name, target_filepath
+                )
+                if spec is None or spec.loader is None:
+                    return
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                # Return to main thread for GTK widget creation
+                GLib.idle_add(self._staged_load_step2, module,
+                              target_module_name, target_filepath)
+            except Exception:
+                traceback.print_exc()
+        thread = threading.Thread(target=_bg_import, daemon=True)
+        thread.start()
+        return False
+    def _staged_load_step2(self, module, module_name, filepath):
+        """Stage 2: Prepare module and create widget (main thread)."""
+        try:
+            module, filename = self._prepare_module(module, module_name, filepath)
+            # Flush pending events so spinner redraws before widget creation
+            ctx = GLib.MainContext.default()
+            while ctx.pending():
+                ctx.iteration(False)
+            self._extract_widgets_from_module(module, filename)
+            # Flush again after widget creation
+            while ctx.pending():
+                ctx.iteration(False)
+            self._select_target_widget()
+        except Exception:
+            traceback.print_exc()
+        return False
     def _load_all_widgets_normal(self):
         """Load all widgets (normal mode)."""
         python_files = [f for f in os.listdir(WIDGET_DIRECTORY) if f.endswith(".py")]
@@ -1018,13 +1095,18 @@ Hidden=false
         else:
             self.widget_stack.set_visible_child_name(stack_page_name)
         self._visible_widget_name = widget_name
-        if self.active_widget_id and isinstance(widget_instance, Gtk.Widget):
-            self._translate_widget_content(widget_instance, self.active_widget_id)
-            self._connect_widget_signals(widget_instance, self.active_widget_id)
-        self._start_translation_monitoring()
         display_name = _(widget_name, self.active_widget_id) if self.active_widget_id else widget_name
         self.set_title(display_name)
         self.content_page.set_title(display_name)
+        # Defer expensive recursive tree walks so widget appears immediately
+        if self.active_widget_id and isinstance(widget_instance, Gtk.Widget):
+            GLib.idle_add(self._deferred_translation_setup, widget_instance, self.active_widget_id)
+    def _deferred_translation_setup(self, widget_instance, widget_id):
+        """Run translation and signal setup after the widget is visible."""
+        self._translate_widget_content(widget_instance, widget_id)
+        self._connect_widget_signals(widget_instance, widget_id)
+        self._start_translation_monitoring()
+        return False
     def update_widget_header(self):
         """Update header bar with widget-specific controls on opposite side of window controls."""
         if not self.hide_sidebar or not hasattr(self, 'content_header'):
@@ -1064,35 +1146,46 @@ Hidden=false
                 return
             module = importlib.util.module_from_spec(spec)
             loader.exec_module(module)
-            filename_base: str = os.path.splitext(os.path.basename(filepath))[0] # type: ignore
-            potential_keys = [filename_base]
-            if len(filename_base) > 2 and filename_base[1] == '-': # type: ignore
-                 potential_keys.append(filename_base[2:]) # type: ignore
-            underscore_keys = [k.replace('-', '_') for k in potential_keys] # type: ignore
-            potential_keys.extend(underscore_keys)
-            manager = get_localization_manager()
-            selected_key = potential_keys[0]
-            for key in potential_keys:
-                if key in manager.widget_translations:
-                    selected_key = key
-                    break
-            if selected_key not in manager.widget_translations:
-                 for key in potential_keys:
-                      clean_key = key.replace('_widget', '').replace('-widget', '') # type: ignore
-                      if clean_key in manager.widget_translations:
-                           selected_key = clean_key
-                           break
-            print(f"DEBUG: Injecting translation for {module_name} using key '{selected_key}'")
-            def injected_underscore(message, widget_id=selected_key):
-                return _translate_with_patterns_helper(message, widget_id)
-            module._ = injected_underscore # type: ignore
-            module.sudo_manager = get_sudo_manager() # type: ignore
-            filename = os.path.basename(filepath)  
-            self._extract_widgets_from_module(module, filename)  
+            self._prepare_and_extract_module(module, module_name, filepath)
+        except Exception:
+            traceback.print_exc()
+    def _prepare_module(self, module, module_name, filepath):
+        """Set up translation and sudo on a loaded module. Returns (module, filename)."""
+        filename_base: str = os.path.splitext(os.path.basename(filepath))[0] # type: ignore
+        potential_keys = [filename_base]
+        if len(filename_base) > 2 and filename_base[1] == '-': # type: ignore
+             potential_keys.append(filename_base[2:]) # type: ignore
+        underscore_keys = [k.replace('-', '_') for k in potential_keys] # type: ignore
+        potential_keys.extend(underscore_keys)
+        manager = get_localization_manager()
+        selected_key = potential_keys[0]
+        for key in potential_keys:
+            if key in manager.widget_translations:
+                selected_key = key
+                break
+        if selected_key not in manager.widget_translations:
+             for key in potential_keys:
+                  clean_key = key.replace('_widget', '').replace('-widget', '') # type: ignore
+                  if clean_key in manager.widget_translations:
+                       selected_key = clean_key
+                       break
+        print(f"DEBUG: Injecting translation for {module_name} using key '{selected_key}'")
+        def injected_underscore(message, widget_id=selected_key):
+            return _translate_with_patterns_helper(message, widget_id)
+        module._ = injected_underscore # type: ignore
+        module.sudo_manager = get_sudo_manager() # type: ignore
+        filename = os.path.basename(filepath)
+        return module, filename
+    def _prepare_and_extract_module(self, module, module_name, filepath):
+        """Prepare a loaded module and extract widgets from it."""
+        try:
+            module, filename = self._prepare_module(module, module_name, filepath)
+            self._extract_widgets_from_module(module, filename)
         except Exception:
             traceback.print_exc()
     def _extract_widgets_from_module(self, module, filename):
         """Extract widget classes from a loaded module."""
+        ctx = GLib.MainContext.default()
         for attribute_name in dir(module):
             attribute = getattr(module, attribute_name)
             if not isinstance(attribute, type):
@@ -1102,7 +1195,12 @@ Hidden=false
             # This prevents trying to instantiate PackageObject and others
             if not issubclass(attribute, Gtk.Widget):
                 continue
-                
+
+            # Flush events before each widget instantiation so the
+            # spinner keeps animating and close button stays responsive.
+            while ctx.pending():
+                ctx.iteration(False)
+
             try:
                 try:
                     widget_instance = attribute(hide_sidebar=self.hide_sidebar, window=self, voice_autostart=self.voice_autostart)
