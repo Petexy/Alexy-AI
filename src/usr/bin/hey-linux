@@ -21,7 +21,7 @@ import venv
 
 CONFIG_DIR = os.path.expanduser("~/.config/linexin-center")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "ai-sysadmin.json")
-MODEL_DIR = os.path.expanduser("~/.local/share/linexin/wakeword-models")
+MODEL_DIR = "/usr/share/linexin/wakewordmodels/"
 VENV_DIR = os.path.expanduser("~/.local/share/linexin/hey-linux-venv")
 
 LINEXIN_CENTER = "linexin-center"
@@ -200,9 +200,9 @@ def launch_widget():
     env = os.environ.copy()
     env["LINEXIN_NEW_INSTANCE"] = "1"
 
-    print(f"[hey-linux] Launching: {cmd} -w r-ai-sysadmin-widget --voice")
+    print(f"[hey-linux] Launching: {cmd} -w aa-alexy-ai-widget --voice")
     return subprocess.Popen(
-        [cmd, "-w", "r-ai-sysadmin-widget", "--voice"],
+        [cmd, "-w", "aa-alexy-ai-widget", "--voice"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
