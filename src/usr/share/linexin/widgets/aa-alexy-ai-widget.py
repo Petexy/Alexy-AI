@@ -500,7 +500,7 @@ class MultilineEntry(Gtk.ScrolledWindow):
         self.textview.add_controller(key_ctrl)
 
 class LinexinAISysadminWidget(Gtk.Box):
-    def __init__(self, hide_sidebar=False, window=None, sudo_manager=None, voice_autostart=False, **kwargs):
+    def __init__(self, hide_sidebar=False, window=None, sudo_manager=None, voice_autostart=False, conversation_id=None, **kwargs):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12) # type: ignore
         self.widgetname = "Alexy AI"
         self.alexy_icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "icons", "github.petexy.alexy.svg")
@@ -580,6 +580,10 @@ class LinexinAISysadminWidget(Gtk.Box):
             ctx.iteration(False)
 
         self.setup_ui()
+
+        # Load a specific conversation if requested (e.g. expanding from compact mode)
+        if conversation_id:
+            GLib.idle_add(self._load_conversation, conversation_id)
 
         # Auto-activate voice input if launched with --voice flag
         if voice_autostart:
@@ -1450,10 +1454,12 @@ class LinexinAISysadminWidget(Gtk.Box):
                 CHUNK_SIZE = 4000  # ~0.125s of audio at 16kHz mono 16-bit
                 SILENCE_THRESHOLD = 500  # RMS amplitude threshold for silence detection
                 SILENCE_TIMEOUT = 2.0  # seconds of silence before auto-send
+                SPEECH_CONFIRM_FRAMES = 3  # consecutive loud frames to confirm speech
 
                 audio_frames: list[bytes] = []
                 last_speech_time: float = time_mod.time()  # type: ignore
                 has_speech = False
+                loud_streak = 0  # count consecutive frames above threshold
 
                 while self.stt_running:
                     proc = self.arecord_proc
@@ -1480,9 +1486,12 @@ class LinexinAISysadminWidget(Gtk.Box):
 
                     if rms > SILENCE_THRESHOLD:
                         last_speech_time = time_mod.time()  # type: ignore
-                        if not has_speech:
+                        loud_streak += 1
+                        if not has_speech and loud_streak >= SPEECH_CONFIRM_FRAMES:
                             has_speech = True
                             GLib.idle_add(self.entry.set_placeholder_text, _("Listening... (speak now)"))
+                    else:
+                        loud_streak = 0
 
                     # If speech was detected and silence timeout reached, transcribe
                     if has_speech and (time_mod.time() - last_speech_time > SILENCE_TIMEOUT):  # type: ignore
@@ -1524,6 +1533,9 @@ class LinexinAISysadminWidget(Gtk.Box):
                         fp16=False
                     )
                     text = result.get("text", "").strip() # type: ignore
+                    detected_lang = result.get("language", "")  # type: ignore
+                    if detected_lang:
+                        self._whisper_detected_lang = detected_lang
                 finally:
                     try:
                         os.unlink(tmp_wav_path)
@@ -3394,7 +3406,26 @@ class LinexinAISysadminWidget(Gtk.Box):
             "small-ko-0.22": ("ESPEAK", "ko")
         }
         fallback = ("en_US-libritts_r-medium", "en/en_US/libritts_r/medium")
-        model_name, model_path = lang_map.get(self.vosk_lang, fallback)
+
+        # When using Whisper STT, use its detected language instead of vosk_lang
+        if self.stt_backend == "whisper" and getattr(self, '_whisper_detected_lang', ''):
+            whisper_lang_map = {
+                "en": ("en_US-libritts_r-medium", "en/en_US/libritts_r/medium"),
+                "zh": ("zh_CN-huayan-medium", "zh/zh_CN/huayan/medium"),
+                "fr": ("fr_FR-siwis-low", "fr/fr_FR/siwis/low"),
+                "de": ("de_DE-thorsten-medium", "de/de_DE/thorsten/medium"),
+                "es": ("es_ES-sharvard-medium", "es/es_ES/sharvard/medium"),
+                "pt": ("pt_PT-tugao-medium", "pt/pt_PT/tugao/medium"),
+                "it": ("it_IT-riccardo-x_low", "it/it_IT/riccardo/x_low"),
+                "ru": ("ru_RU-denis-medium", "ru/ru_RU/denis/medium"),
+                "uk": ("uk_UA-ukromir-medium", "uk/uk_UA/ukromir/medium"),
+                "pl": ("pl_PL-gosia-medium", "pl/pl_PL/gosia/medium"),
+                "ja": ("ESPEAK", "ja"),
+                "ko": ("ESPEAK", "ko"),
+            }
+            model_name, model_path = whisper_lang_map.get(self._whisper_detected_lang, fallback)
+        else:
+            model_name, model_path = lang_map.get(self.vosk_lang, fallback)
         
         # Fast-track unsupported AI languages to espeak-ng natively
         if model_name == "ESPEAK":
@@ -3484,19 +3515,530 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.spinner.set_visible(False)
         self.entry.grab_focus()
 
+class CompactVoiceWindow(Adw.Window):
+    """A small floating pill-shaped voice assistant bar.
+
+    Launched via ``linexin-center -w aa-alexy-ai-widget --voice --compact``
+    (e.g. from the hey-linux daemon).  Provides four buttons:
+
+    * Close — terminate the compact window
+    * Microphone — toggle speech-to-text recording
+    * Settings — open the Alexy AI settings dialog
+    * Expand — save the current conversation, open the full Alexy AI widget
+      with ``linexin-center -w aa-alexy-ai-widget --conversation <id>``,
+      and close the compact window
+    """
+
+    _CSS = """
+    .compact-voice-window {
+        background: transparent;
+    }
+    .compact-voice-window, .compact-voice-window > * {
+        min-width: 0;
+        min-height: 0;
+    }
+    .compact-voice-bar {
+        background: alpha(@window_bg_color, 0.92);
+        border-radius: 28px;
+        border: 1px solid alpha(@borders, 0.35);
+        padding: 6px 10px;
+        box-shadow: 0 4px 16px alpha(black, 0.18), 0 1px 4px alpha(black, 0.10);
+    }
+    .compact-voice-bar button {
+        border-radius: 50%;
+        min-width: 40px;
+        min-height: 40px;
+        padding: 0;
+    }
+    .compact-voice-bar .compact-mic-btn {
+        background: alpha(@accent_bg_color, 0.12);
+        min-width: 48px;
+        min-height: 48px;
+    }
+    .compact-voice-bar .compact-mic-btn:checked {
+        background: @accent_bg_color;
+        color: @accent_fg_color;
+    }
+    .compact-voice-bar .compact-mic-btn:disabled {
+        opacity: 0.5;
+    }
+    .compact-status-label {
+        font-size: 11px;
+        margin-top: 2px;
+        margin-bottom: 2px;
+    }
+    .compact-spinner {
+        min-width: 16px;
+        min-height: 16px;
+    }
+    """
+
+    def __init__(self, voice_autostart=False, **kwargs):
+        super().__init__(**kwargs)
+
+        self.set_title("Alexy")
+        self.set_default_size(260, -1)  # Fixed width matching bar; height shrink-wraps
+        self.set_size_request(260, -1)
+        self.set_resizable(False)
+        self.set_deletable(False)
+        self.set_decorated(False)
+
+        # Apply compact CSS
+        css_provider = Gtk.CssProvider()
+        css_provider.load_from_data(self._CSS.encode("utf-8"))
+        Gtk.StyleContext.add_provider_for_display(
+            self.get_display(),
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 10,
+        )
+
+        self.add_css_class("compact-voice-window")
+
+        # Create the hidden AI widget that handles all backend / STT logic.
+        # It is never displayed; we use its methods and state only.
+        self._ai_widget = LinexinAISysadminWidget(
+            hide_sidebar=True,
+            window=self,
+            voice_autostart=False,  # we control mic ourselves
+        )
+        # Keep a reference so it is not GC'd
+        self._ai_widget.set_visible(False)
+
+        # Track whether voice_autostart was requested
+        self._voice_autostart = voice_autostart
+
+        # ---- Build the pill bar ----
+        root_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        bar.add_css_class("compact-voice-bar")
+        bar.set_halign(Gtk.Align.CENTER)
+        bar.set_valign(Gtk.Align.CENTER)
+        bar.set_margin_top(6)
+        bar.set_margin_bottom(6)
+        bar.set_margin_start(6)
+        bar.set_margin_end(6)
+
+        # Close button
+        close_btn = Gtk.Button(icon_name="window-close-symbolic")
+        close_btn.add_css_class("flat")
+        close_btn.set_tooltip_text(_("Close"))
+        close_btn.connect("clicked", self._on_close_clicked)
+        bar.append(close_btn)
+
+        # Microphone toggle
+        self._mic_btn = Gtk.ToggleButton()
+        mic_icon = Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic")
+        # Try loading themed mic icon
+        theme_mic = self._ai_widget._get_theme_svg("microphone-icon.svg")
+        if theme_mic:
+            mic_icon.set_from_file(theme_mic)
+        self._mic_btn.set_child(mic_icon)
+        self._mic_btn.add_css_class("compact-mic-btn")
+        self._mic_btn.set_tooltip_text(_("Listen"))
+        self._mic_btn.connect("toggled", self._on_mic_toggled)
+        bar.append(self._mic_btn)
+
+        # Settings button
+        settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
+        settings_btn.add_css_class("flat")
+        settings_btn.set_tooltip_text(_("Settings"))
+        settings_btn.connect("clicked", self._on_settings_clicked)
+        bar.append(settings_btn)
+
+        # Expand chat button
+        expand_btn = Gtk.Button(icon_name="view-fullscreen-symbolic")
+        expand_btn.add_css_class("flat")
+        expand_btn.set_tooltip_text(_("Expand chat"))
+        expand_btn.connect("clicked", self._on_expand_clicked)
+        bar.append(expand_btn)
+
+        root_box.append(bar)
+
+        # Status area below the bar — hidden by default so the window stays tight
+        self._status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._status_box.set_halign(Gtk.Align.FILL)
+        self._status_box.set_margin_start(12)
+        self._status_box.set_margin_end(12)
+        self._status_box.set_margin_bottom(4)
+        self._status_box.set_visible(False)
+
+        # Spinner row (for loading / thinking states)
+        spinner_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        spinner_row.set_halign(Gtk.Align.CENTER)
+        self._status_spinner = Gtk.Spinner()
+        self._status_spinner.add_css_class("compact-spinner")
+        self._status_spinner.set_visible(False)
+        spinner_row.append(self._status_spinner)
+        self._status_spinner_label = Gtk.Label(label="")
+        self._status_spinner_label.add_css_class("compact-status-label")
+        self._status_spinner_label.add_css_class("dim-label")
+        self._status_spinner_label.set_visible(False)
+        spinner_row.append(self._status_spinner_label)
+        self._spinner_row = spinner_row
+        self._status_box.append(spinner_row)
+
+        # Scrollable area for LLM response text
+        self._status_scroll = Gtk.ScrolledWindow()
+        self._status_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._status_scroll.set_max_content_height(140)
+        self._status_scroll.set_propagate_natural_height(True)
+        self._status_scroll.set_visible(False)
+        self._status_scroll.set_halign(Gtk.Align.FILL)
+        self._status_scroll.set_hexpand(True)
+
+        self._status_label = Gtk.Label(label="")
+        self._status_label.add_css_class("compact-status-label")
+        self._status_label.add_css_class("dim-label")
+        self._status_label.set_wrap(True)
+        self._status_label.set_wrap_mode(2)  # PANGO_WRAP_WORD_CHAR
+        self._status_label.set_max_width_chars(44)
+        self._status_label.set_selectable(True)
+        self._status_label.set_xalign(0.5)
+        self._status_label.set_halign(Gtk.Align.FILL)
+        self._status_scroll.set_child(self._status_label)
+        self._status_box.append(self._status_scroll)
+
+        root_box.append(self._status_box)
+
+        self.set_content(root_box)
+
+        # Mirror STT state changes from the hidden widget
+        self._ai_widget.stt_toggle.connect("toggled", self._on_widget_stt_changed)
+
+        # Mirror sensitivity changes on the hidden widget's stt_toggle
+        self._ai_widget.stt_toggle.connect("notify::sensitive", self._on_widget_stt_sensitivity_changed)
+
+        # Intercept new assistant messages so we can update the status label
+        self._original_add_bubble = self._ai_widget.add_message_bubble
+        self._ai_widget.add_message_bubble = self._intercepted_add_bubble
+
+        # Intercept Whisper model loading to show feedback in compact mode
+        self._original_stt_start_whisper = self._ai_widget._stt_start_whisper
+        self._ai_widget._stt_start_whisper = self._intercepted_stt_start_whisper
+
+        # Intercept entry placeholder text to show STT phases
+        # (Listening…, Transcribing…, etc.) in compact status bar
+        self._original_set_placeholder = self._ai_widget.entry.set_placeholder_text
+        self._ai_widget.entry.set_placeholder_text = self._intercepted_set_placeholder
+
+        # Intercept thinking indicator to show "Thinking…" spinner in compact bar
+        self._original_show_thinking = self._ai_widget._show_thinking_indicator
+        self._original_remove_thinking = self._ai_widget._remove_thinking_indicator
+        self._ai_widget._show_thinking_indicator = self._compact_show_thinking
+        self._ai_widget._remove_thinking_indicator = self._compact_remove_thinking
+
+        # Intercept play_tts so we can force mic sensitive when TTS starts
+        self._original_play_tts = self._ai_widget.play_tts
+        self._ai_widget.play_tts = self._intercepted_play_tts
+
+        # Start Whisper model loading immediately in the background so the
+        # user gets visual feedback and the model is ready when they press mic
+        if voice_autostart and self._ai_widget.stt_backend == "whisper":
+            self._preload_whisper_model()
+        elif voice_autostart:
+            GLib.idle_add(self._mic_btn.set_active, True)
+
+    # -------------------------------------------------------------------
+    # Whisper model preloading with visual feedback
+    # -------------------------------------------------------------------
+    def _preload_whisper_model(self):
+        """Preload the Whisper model in background, showing status in the bar."""
+        # Check if model is already loaded
+        if hasattr(self._ai_widget, '_whisper_model_obj') and \
+           getattr(self._ai_widget, '_whisper_model_name', None) == self._ai_widget.whisper_model:
+            GLib.idle_add(self._mic_btn.set_active, True)
+            return
+
+        # Check if model file exists (needs download first)
+        whisper_cache = os.path.expanduser("~/.cache/whisper")
+        model_file = os.path.join(whisper_cache, f"{self._ai_widget.whisper_model}.pt")
+        if not os.path.exists(model_file):
+            # Model not downloaded — delegate to normal flow which shows download dialog
+            GLib.idle_add(self._mic_btn.set_active, True)
+            return
+
+        # Model file exists but not loaded — show loading indicator
+        self._mic_btn.set_sensitive(False)
+        self._show_status(_("Loading voice model…"), spinner=True)
+
+        def _bg_load():
+            try:
+                import whisper as whisper_module  # type: ignore
+                model_obj = whisper_module.load_model(self._ai_widget.whisper_model)
+                GLib.idle_add(self._on_preload_ready, model_obj)
+            except Exception as e:
+                GLib.idle_add(self._on_preload_failed, str(e))
+
+        threading.Thread(target=_bg_load, daemon=True).start()
+
+    def _on_preload_ready(self, model_obj):
+        self._ai_widget._whisper_model_obj = model_obj
+        self._ai_widget._whisper_model_name = self._ai_widget.whisper_model
+        self._mic_btn.set_sensitive(True)
+        self._hide_status()
+        # Now auto-start mic
+        GLib.idle_add(self._mic_btn.set_active, True)
+        return False
+
+    def _on_preload_failed(self, error_msg):
+        self._mic_btn.set_sensitive(True)
+        self._show_status(_("Model load failed: ") + error_msg)
+        return False
+
+    # -------------------------------------------------------------------
+    # Intercept Whisper loading to show feedback in compact mode
+    # -------------------------------------------------------------------
+    def _intercepted_stt_start_whisper(self, btn):
+        """Wrap _stt_start_whisper to show loading status in compact bar."""
+        # If model needs loading (not cached), show compact spinner
+        if not (hasattr(self._ai_widget, '_whisper_model_obj') and
+                getattr(self._ai_widget, '_whisper_model_name', None) == self._ai_widget.whisper_model):
+            whisper_cache = os.path.expanduser("~/.cache/whisper")
+            model_file = os.path.join(whisper_cache, f"{self._ai_widget.whisper_model}.pt")
+            if os.path.exists(model_file):
+                # Model file exists but needs importing — show loading spinner
+                self._show_status(_("Loading voice model…"), spinner=True)
+                # Hook into the ready/failed callbacks for cleanup
+                orig_ready = self._ai_widget._on_whisper_model_ready
+                orig_failed = self._ai_widget._on_whisper_model_failed
+                def _wrapped_ready(model_obj, btn_arg):
+                    self._hide_status()
+                    return orig_ready(model_obj, btn_arg)
+                def _wrapped_failed(error_msg, btn_arg):
+                    self._show_status(_("Model load failed"))
+                    return orig_failed(error_msg, btn_arg)
+                self._ai_widget._on_whisper_model_ready = _wrapped_ready
+                self._ai_widget._on_whisper_model_failed = _wrapped_failed
+
+        self._original_stt_start_whisper(btn)
+
+    # -------------------------------------------------------------------
+    # Intercept entry placeholder to mirror STT phase in compact bar
+    # -------------------------------------------------------------------
+    _PLACEHOLDER_STATUS_MAP = None
+
+    @classmethod
+    def _get_placeholder_map(cls):
+        if cls._PLACEHOLDER_STATUS_MAP is None:
+            cls._PLACEHOLDER_STATUS_MAP = {
+                _("Listening..."): (_("Listening…"), False),
+                _("Listening... (speak now)"): (_("Listening… (speak now)"), False),
+                _("Transcribing..."): (_("Transcribing…"), True),
+                _("Loading Whisper model..."): (_("Loading voice model…"), True),
+            }
+        return cls._PLACEHOLDER_STATUS_MAP
+
+    def _intercepted_set_placeholder(self, text):
+        """Mirror STT placeholder text changes in the compact status bar."""
+        self._original_set_placeholder(text)
+        mapping = self._get_placeholder_map()
+        if text in mapping:
+            label, spinner = mapping[text]
+            self._show_status(label, spinner=spinner)
+        elif text == _("Ask a question..."):
+            # Only hide status if it was showing a transient STT phase
+            current = self._status_spinner_label.get_label()
+            transient = {v[0] for v in mapping.values()}
+            if current in transient:
+                self._hide_status()
+
+    # -------------------------------------------------------------------
+    # Thinking indicator intercepts
+    # -------------------------------------------------------------------
+    def _compact_show_thinking(self):
+        """Show 'Thinking…' spinner in the compact bar and call original."""
+        self._original_show_thinking()
+        self._show_status(_('Thinking…'), spinner=True)
+
+    def _compact_remove_thinking(self):
+        """Remove thinking indicator from compact bar and call original."""
+        self._original_remove_thinking()
+        # Only hide the spinner row — an assistant response may follow
+        self._status_spinner.stop()
+        self._status_spinner.set_visible(False)
+        self._status_spinner_label.set_visible(False)
+
+    # -------------------------------------------------------------------
+    # Intercept play_tts to force mic button sensitive during TTS
+    # -------------------------------------------------------------------
+    def _intercepted_play_tts(self, text, on_ready=None):
+        """Wrap play_tts to ensure _mic_btn stays sensitive during TTS."""
+        self._original_play_tts(text, on_ready=on_ready)
+        # _speak_text schedules TTS via GLib.timeout_add(100, run_piper/run_espeak).
+        # After it fires and sets tts_playing=True + stt_toggle.set_sensitive(False),
+        # we need to re-enable the compact mic button.  Use a slightly longer
+        # delay to run after the TTS scheduling callback.
+        def _ensure_mic_sensitive():
+            if getattr(self._ai_widget, 'tts_playing', False):
+                self._mic_btn.set_sensitive(True)
+            return False
+        GLib.timeout_add(250, _ensure_mic_sensitive)
+
+    # -------------------------------------------------------------------
+    # Status helpers
+    # -------------------------------------------------------------------
+    def _show_status(self, text, spinner=False):
+        """Show a transient status in the spinner row (Listening, Thinking, etc)."""
+        self._status_box.set_visible(True)
+        self._status_spinner_label.set_label(text)
+        self._status_spinner_label.set_visible(True)
+        self._status_scroll.set_visible(False)
+        if spinner:
+            self._status_spinner.set_visible(True)
+            self._status_spinner.start()
+        else:
+            self._status_spinner.stop()
+            self._status_spinner.set_visible(False)
+
+    def _show_response(self, text):
+        """Show an LLM response in the scrollable label."""
+        self._status_box.set_visible(True)
+        self._status_spinner.stop()
+        self._status_spinner.set_visible(False)
+        self._status_spinner_label.set_visible(False)
+        self._status_label.set_label(text)
+        self._status_scroll.set_visible(True)
+
+    def _hide_status(self):
+        self._status_box.set_visible(False)
+        self._status_spinner.stop()
+        self._status_spinner.set_visible(False)
+        self._status_spinner_label.set_visible(False)
+        self._status_scroll.set_visible(False)
+
+    # -------------------------------------------------------------------
+    # Intercept assistant bubbles to reflect in the status label
+    # -------------------------------------------------------------------
+    def _intercepted_add_bubble(self, role, content):
+        """Wrap add_message_bubble to mirror status in compact bar."""
+        self._original_add_bubble(role, content)
+        if role == "assistant":
+            text = self._ai_widget._extract_text_from_content(content)
+            if text:
+                self._show_response(text.strip()[:500])
+
+    # -------------------------------------------------------------------
+    # Button handlers
+    # -------------------------------------------------------------------
+    def _on_close_clicked(self, _btn):
+        # Stop any active STT / TTS before closing
+        if self._ai_widget.stt_toggle.get_active():
+            self._ai_widget.stt_toggle.set_active(False)
+        if getattr(self._ai_widget, 'tts_playing', False):
+            self._ai_widget._stop_tts()
+        self._ai_widget._save_conversation()
+        self.close()
+
+    def _on_mic_toggled(self, btn):
+        """Forward mic toggle to the hidden AI widget's STT toggle."""
+        active = btn.get_active()
+        if active:
+            # If TTS (Piper) is currently speaking, stop it first
+            if getattr(self._ai_widget, 'tts_playing', False):
+                self._ai_widget._stop_tts()
+                # _stop_tts re-enables stt_toggle sensitivity
+            # If the widget's stt_toggle is insensitive (e.g. during LLM processing),
+            # queue activation for when it becomes sensitive again
+            if not self._ai_widget.stt_toggle.get_sensitive():
+                btn.set_active(False)
+                self._pending_mic_activate = True
+                return
+        # Avoid feedback loop
+        if self._ai_widget.stt_toggle.get_active() != active:
+            self._ai_widget.stt_toggle.set_active(active)
+        if active:
+            self._show_status(_("Listening…"))
+        else:
+            current = self._status_spinner_label.get_label()
+            if current == _("Listening…"):
+                self._hide_status()
+
+    def _on_widget_stt_changed(self, toggle):
+        """Sync compact mic button when the widget's STT toggle changes."""
+        active = toggle.get_active()
+        if self._mic_btn.get_active() != active:
+            self._mic_btn.set_active(active)
+
+    def _on_widget_stt_sensitivity_changed(self, toggle, _pspec):
+        """Sync compact mic button sensitivity with widget's stt_toggle.
+
+        During TTS playback we deliberately keep _mic_btn sensitive so
+        the user can tap it to stop TTS and re-start listening.
+        """
+        sensitive = toggle.get_sensitive()
+        if not sensitive and getattr(self._ai_widget, 'tts_playing', False):
+            # TTS is speaking — keep mic clickable so user can interrupt
+            self._mic_btn.set_sensitive(True)
+            return
+        self._mic_btn.set_sensitive(sensitive)
+        # If mic was pending activation and stt_toggle just became sensitive again
+        if sensitive and getattr(self, '_pending_mic_activate', False):
+            self._pending_mic_activate = False
+            GLib.idle_add(self._mic_btn.set_active, True)
+
+    def _on_settings_clicked(self, _btn):
+        self._ai_widget.on_settings_clicked(_btn)
+
+    def _on_expand_clicked(self, _btn):
+        """Save conversation, launch full Alexy AI widget, and close compact window."""
+        self._ai_widget._save_conversation()
+        conv_id = self._ai_widget.current_conversation_id
+
+        # Stop STT / TTS
+        if self._ai_widget.stt_toggle.get_active():
+            self._ai_widget.stt_toggle.set_active(False)
+        if getattr(self._ai_widget, 'tts_playing', False):
+            self._ai_widget._stop_tts()
+
+        # Find linexin-center executable
+        import shutil
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            shutil.which("linexin-center"),
+            os.path.join(script_dir, "..", "..", "..", "bin", "linexin-center"),
+            os.path.join(script_dir, "..", "..", "bin", "linexin-center"),
+        ]
+        cmd = None
+        for c in candidates:
+            if c and os.path.isfile(c):
+                cmd = os.path.realpath(c)
+                break
+
+        if cmd:
+            env = os.environ.copy()
+            env["LINEXIN_NEW_INSTANCE"] = "1"
+            subprocess.Popen(
+                [cmd, "-w", "aa-alexy-ai-widget", "--conversation", conv_id],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                env=env,
+            )
+
+        self.close()
+
+
 if __name__ == "__main__":
-    class TestWindow(Gtk.ApplicationWindow):
-        def __init__(self, app):
-            super().__init__(application=app) # type: ignore
-            self.set_title("AI Sysadmin Widget")
-            self.set_default_size(800, 600)
-            widget = LinexinAISysadminWidget(hide_sidebar=True, window=self)
-            self.set_child(widget)
+    import sys as _sys
+    _compact = "--compact" in _sys.argv
+    _voice = "--voice" in _sys.argv
 
     class TestApp(Gtk.Application):
-        def do_activate(self):
-            window = TestWindow(self)
-            window.present()
+        def do_activate(self_app):
+            if _compact:
+                win = CompactVoiceWindow(
+                    application=self_app,
+                    voice_autostart=_voice,
+                )
+                win.present()
+            else:
+                win = Gtk.ApplicationWindow(application=self_app)
+                win.set_title("AI Sysadmin Widget")
+                win.set_default_size(800, 600)
+                widget = LinexinAISysadminWidget(hide_sidebar=True, window=win)
+                win.set_child(widget)
+                win.present()
 
     app = TestApp()
     app.run()

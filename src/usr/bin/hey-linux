@@ -200,9 +200,9 @@ def launch_widget():
     env = os.environ.copy()
     env["LINEXIN_NEW_INSTANCE"] = "1"
 
-    print(f"[hey-linux] Launching: {cmd} -w aa-alexy-ai-widget --voice")
+    print(f"[hey-linux] Launching: {cmd} -w aa-alexy-ai-widget --voice --compact")
     return subprocess.Popen(
-        [cmd, "-w", "aa-alexy-ai-widget", "--voice"],
+        [cmd, "-w", "aa-alexy-ai-widget", "--voice", "--compact"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,

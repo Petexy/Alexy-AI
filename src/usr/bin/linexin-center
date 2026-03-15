@@ -528,11 +528,12 @@ def _(key, widget_name="widget_loader"):
     return get_localization_manager().get_text(key, widget_name)
 class WidgetLoaderWindow(Adw.ApplicationWindow):
     """Main application window with sidebar and content area."""
-    def __init__(self, *args: Any, hide_sidebar: bool=False, target_widget: Optional[str]=None, voice_autostart: bool=False, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, hide_sidebar: bool=False, target_widget: Optional[str]=None, voice_autostart: bool=False, conversation_id: Optional[str]=None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.hide_sidebar: bool = hide_sidebar
         self.target_widget: Optional[str] = target_widget
         self.voice_autostart: bool = voice_autostart
+        self.conversation_id: Optional[str] = conversation_id
         self.l10n = get_localization_manager()
         self.set_title(_("Linexin Center"))
         if self.hide_sidebar:
@@ -1288,7 +1289,7 @@ Hidden=false
 
             try:
                 try:
-                    widget_instance = attribute(hide_sidebar=self.hide_sidebar, window=self, voice_autostart=self.voice_autostart)
+                    widget_instance = attribute(hide_sidebar=self.hide_sidebar, window=self, voice_autostart=self.voice_autostart, conversation_id=self.conversation_id)
                 except TypeError:
                     widget_instance = attribute()
                 if hasattr(widget_instance, 'widgetname'):
@@ -1902,6 +1903,8 @@ class WidgetLoaderApp(Adw.Application):
         self.hide_sidebar: bool = False
         self.target_widget: Optional[str] = None
         self.voice_autostart: bool = False
+        self.compact_mode: bool = False
+        self.conversation_id: Optional[str] = None
         self.window: Optional[WidgetLoaderWindow] = None
         self._parse_arguments()
     def _parse_arguments(self):
@@ -1935,6 +1938,15 @@ class WidgetLoaderApp(Adw.Application):
                     sys.exit(1)
             elif arg == '--voice':
                 self.voice_autostart = True
+            elif arg == '--compact':
+                self.compact_mode = True
+            elif arg == '--conversation':
+                try:
+                    conv_arg: str = next(args_iter)
+                    self.conversation_id = str(conv_arg)
+                except StopIteration:
+                    print("Error: --conversation requires a conversation id")
+                    sys.exit(1)
             elif arg == '--version' or arg == '-v':
                 print(f"Linexin Tools v{APP_VERSION}")
                 sys.exit(0)
@@ -1944,15 +1956,21 @@ class WidgetLoaderApp(Adw.Application):
         sys.argv.clear()
         sys.argv.extend(new_argv)
         print(f"Cleaned arguments for GTK: {sys.argv}")
-        print(f"Final settings: hide_sidebar={self.hide_sidebar}, target_widget={self.target_widget}, voice_autostart={self.voice_autostart}")
+        print(f"Final settings: hide_sidebar={self.hide_sidebar}, target_widget={self.target_widget}, voice_autostart={self.voice_autostart}, compact_mode={self.compact_mode}, conversation_id={self.conversation_id}")
 
     def on_activate(self, app: Adw.Application) -> None:
         """Handle application activation."""
+        # Compact voice mode — launch the small floating pill bar instead
+        if self.compact_mode and self.target_widget:
+            self._launch_compact_voice(app)
+            return
+
         window_instance = WidgetLoaderWindow(
             application=app,
             hide_sidebar=self.hide_sidebar,
             target_widget=self.target_widget,
-            voice_autostart=self.voice_autostart
+            voice_autostart=self.voice_autostart,
+            conversation_id=self.conversation_id,
         )
         self.window = window_instance
         window_instance.present()
@@ -1975,6 +1993,61 @@ class WidgetLoaderApp(Adw.Application):
                     toggle.set_active(False)
                 toggle.set_active(True)
         return False  # Don't repeat the GLib idle callback
+
+    def _launch_compact_voice(self, app: Adw.Application) -> None:
+        """Launch the compact floating voice bar from the target widget module."""
+        widget_dir = str(Path(__file__).resolve().parent.parent / "share" / "linexin" / "widgets")
+        target = self.target_widget or ""
+        filepath = os.path.join(widget_dir, target + ".py")
+        if not os.path.isfile(filepath):
+            print(f"Error: widget file not found: {filepath}")
+            return
+        spec = importlib.util.spec_from_file_location(target, filepath)
+        if spec is None or spec.loader is None:
+            print(f"Error: cannot load widget module: {filepath}")
+            return
+        module = importlib.util.module_from_spec(spec)
+        # Inject translation + sudo
+        manager = get_localization_manager()
+        potential_keys = [target, target.replace('-', '_')]
+        if len(target) > 2 and target[1] == '-':
+            potential_keys.append(target[2:])
+        potential_keys.extend([k.replace('_widget', '').replace('-widget', '') for k in list(potential_keys)])
+        selected_key = potential_keys[0]
+        for key in potential_keys:
+            if key in manager.widget_translations:
+                selected_key = key
+                break
+        def injected_underscore(message, widget_id=selected_key):
+            return _translate_with_patterns_helper(message, widget_id)
+        setattr(module, '_', injected_underscore)
+        setattr(module, 'sudo_manager', get_sudo_manager())
+        spec.loader.exec_module(module)
+        compact_cls = getattr(module, 'CompactVoiceWindow', None)
+        if compact_cls is None:
+            print("Error: CompactVoiceWindow class not found in widget module")
+            return
+        win = compact_cls(
+            application=app,
+            voice_autostart=self.voice_autostart,
+        )
+        self.window = win
+        win.present()
+
+        def _sigusr1_handler(signum, frame):
+            GLib.idle_add(self._reactivate_voice_compact)
+        signal.signal(signal.SIGUSR1, _sigusr1_handler)
+
+    def _reactivate_voice_compact(self):
+        """Reactivate voice input on the compact voice window."""
+        win = self.window
+        if win and hasattr(win, '_mic_btn'):
+            mic = win._mic_btn
+            if mic.get_active():
+                mic.set_active(False)
+            mic.set_active(True)
+        return False
+
 def main():
     """Application entry point."""
     app = WidgetLoaderApp()
