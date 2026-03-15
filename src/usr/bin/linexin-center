@@ -18,6 +18,7 @@ import tempfile
 import atexit
 import re
 import json
+import signal
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -205,7 +206,7 @@ FALLBACK_LANGUAGE = "en_US"
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "linexin")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "linexin-center.json")
 
-def _load_config():
+def _load_config() -> Dict[str, Any]:
     """Load app configuration from JSON file."""
     try:
         if os.path.exists(CONFIG_FILE):
@@ -417,16 +418,16 @@ class WidgetLocalizationManager(GObject.Object):
         if getattr(self, '_initialized', False):
             return
         super().__init__()
-        self.system_language = self._get_system_language()
+        self.system_language: str = str(self._get_system_language())
         print(f"System language detected: {self.system_language}")
-        self.widget_translations = {}
+        self.widget_translations: Dict[str, Dict[str, Dict[str, str]]] = {}
         self._load_all_translations()
         print(f"DEBUG: Loaded translations for widgets: {list(self.widget_translations.keys())}")
         if 'system_updater' in self.widget_translations:
              print(f"DEBUG: system_updater languages: {list(self.widget_translations['system_updater'].keys())}")
-        self._initialized = True
-        self.selection_timeout_id = None
-        self.pending_widget_selection = None
+        self._initialized: bool = True
+        self.selection_timeout_id: Optional[int] = None
+        self.pending_widget_selection: Any = None
     def _get_system_language(self):
         """Get the system language code."""
         try:
@@ -438,9 +439,9 @@ class WidgetLocalizationManager(GObject.Object):
             pass
         lang_env = os.environ.get('LANG', '')
         if lang_env:
-            lang_code = lang_env.split('.')[0]
-            if lang_code:
-                return lang_code
+            lang_code_env: str = lang_env.split('.')[0]
+            if lang_code_env:
+                return lang_code_env
         return FALLBACK_LANGUAGE
     def _load_all_translations(self):
         """Load all available translations from the directory structure."""
@@ -527,11 +528,11 @@ def _(key, widget_name="widget_loader"):
     return get_localization_manager().get_text(key, widget_name)
 class WidgetLoaderWindow(Adw.ApplicationWindow):
     """Main application window with sidebar and content area."""
-    def __init__(self, *args, hide_sidebar=False, target_widget=None, voice_autostart=False, **kwargs):
+    def __init__(self, *args: Any, hide_sidebar: bool=False, target_widget: Optional[str]=None, voice_autostart: bool=False, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.hide_sidebar = hide_sidebar
-        self.target_widget = target_widget
-        self.voice_autostart = voice_autostart
+        self.hide_sidebar: bool = hide_sidebar
+        self.target_widget: Optional[str] = target_widget
+        self.voice_autostart: bool = voice_autostart
         self.l10n = get_localization_manager()
         self.set_title(_("Linexin Center"))
         if self.hide_sidebar:
@@ -545,14 +546,14 @@ class WidgetLoaderWindow(Adw.ApplicationWindow):
         self._visible_widget_name: Optional[str] = None  
         self.active_widget: Any = None
         self.active_widget_id: Optional[str] = None
-        self.translation_timer = None
-        self.first_widget_loaded = False
-        self.selection_timeout_id = None
-        self.pending_widget_selection = None
-        self._compact_mode = False
-        self._saved_compact = _load_config().get("compact_mode", False)
-        self._sidebar_rows: list = []
-        self._compact_icon_buttons: list = []
+        self.translation_timer: Optional[int] = None
+        self.first_widget_loaded: bool = False
+        self.selection_timeout_id: Optional[int] = None
+        self.pending_widget_selection: Any = None
+        self._compact_mode: bool = False
+        self._saved_compact: bool = bool(_load_config().get("compact_mode", False))
+        self._sidebar_rows: list[Any] = []
+        self._compact_icon_buttons: list[Any] = []
         self._sidebar_anim: Optional[Adw.TimedAnimation] = None
         self._btn_rotate_anim: Optional[Adw.TimedAnimation] = None
         self._btn_rotation_deg = 180.0
@@ -1039,39 +1040,48 @@ Hidden=false
             self._select_target_widget()
         elif not self.hide_sidebar:
             self._auto_select_first_widget()
-    def _staged_load_step1(self):
+    def _staged_load_step1(self) -> bool:
         """Stage 1: Find target file, then load module in a background thread."""
-        target_normalized = self.target_widget.lower().replace('-', '_').replace(' ', '_')
+        target_w = self.target_widget
+        if not target_w:
+            return False
+        target_normalized = target_w.lower().replace('-', '_').replace(' ', '_')
         if not target_normalized.endswith('.py'):
             target_normalized += '.py'
         if not os.path.exists(WIDGET_DIRECTORY):
             return False
         python_files = [f for f in os.listdir(WIDGET_DIRECTORY) if f.endswith(".py")]
-        target_file = None
+        target_file: Optional[str] = None
         for filename in python_files:
             filename_normalized = filename.lower().replace('-', '_').replace(' ', '_')
             if (filename_normalized == target_normalized or
-                filename.lower() == self.target_widget.lower() or
-                filename.lower() == self.target_widget.lower() + '.py'):
+                filename.lower() == target_w.lower() or
+                filename.lower() == target_w.lower() + '.py'):
                 target_file = filename
                 break
-        if not target_file:
+        if target_file is None:
             print(f"Target widget file not found: {self.target_widget}")
             return False
-        target_filepath = os.path.join(WIDGET_DIRECTORY, target_file)
-        target_module_name = target_file[:-3]
+        target_filepath: str = os.path.join(WIDGET_DIRECTORY, str(target_file))
+        target_module_name: str = str(target_file).replace('.py', '')
         print(f"Loading target widget (threaded): {target_file}")
         # Run the heavy exec_module in a background thread so the GTK main
         # loop keeps processing redraws (spinner) and input (close button).
-        def _bg_import():
+        def _bg_import() -> None:
             try:
                 spec = importlib.util.spec_from_file_location(
                     target_module_name, target_filepath
                 )
-                if spec is None or spec.loader is None:
+                if spec is None:
+                    return
+                # Safely bind the non-None loader because Pyre forgets the `spec is None` guarantee
+                active_loader: Any = getattr(spec, 'loader', None)
+                if active_loader is None:
                     return
                 module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
+                if hasattr(active_loader, 'exec_module'):
+                    loader_func: Any = getattr(active_loader, 'exec_module')
+                    loader_func(module)
                 # Return to main thread for GTK widget creation
                 GLib.idle_add(self._staged_load_step2, module,
                               target_module_name, target_filepath)
@@ -1101,30 +1111,31 @@ Hidden=false
         python_files = [f for f in os.listdir(WIDGET_DIRECTORY) if f.endswith(".py")]
         python_files.sort()
         for filename in python_files:
-            filepath = os.path.join(WIDGET_DIRECTORY, filename)
-            module_name = filename[:-3] # type: ignore
+            filepath: str = os.path.join(WIDGET_DIRECTORY, filename)
+            module_name: str = filename[:-3] # type: ignore
             self._load_widget_from_file(filepath, module_name)
     def _load_target_widget_only(self):
         """Load only the target widget specified via command line."""
-        if not self.target_widget:
+        target_w = self.target_widget
+        if not target_w:
             return
-        target_normalized = self.target_widget.lower().replace('-', '_').replace(' ', '_')
+        target_normalized = target_w.lower().replace('-', '_').replace(' ', '_')
         if not target_normalized.endswith('.py'):
             target_normalized += '.py'
         if not os.path.exists(WIDGET_DIRECTORY):
             return
         python_files = [f for f in os.listdir(WIDGET_DIRECTORY) if f.endswith(".py")]
-        target_file = None
+        target_file: Optional[str] = None
         for filename in python_files:
             filename_normalized = filename.lower().replace('-', '_').replace(' ', '_')
             if (filename_normalized == target_normalized or 
-                filename.lower() == self.target_widget.lower() or
-                filename.lower() == self.target_widget.lower() + '.py'):
+                filename.lower() == target_w.lower() or
+                filename.lower() == target_w.lower() + '.py'):
                 target_file = filename
                 break
-        if target_file:
-            filepath = os.path.join(WIDGET_DIRECTORY, target_file) # type: ignore
-            module_name = target_file[:-3] # type: ignore
+        if target_file and isinstance(target_file, str):
+            filepath: str = os.path.join(WIDGET_DIRECTORY, target_file)
+            module_name: str = target_file[:-3] # type: ignore
             print(f"Loading only target widget: {target_file}")
             self._load_widget_from_file(filepath, module_name)
         else:
@@ -1224,11 +1235,12 @@ Hidden=false
             traceback.print_exc()
     def _prepare_module(self, module, module_name, filepath):
         """Set up translation and sudo on a loaded module. Returns (module, filename)."""
-        filename_base: str = os.path.splitext(os.path.basename(filepath))[0] # type: ignore
-        potential_keys = [filename_base]
-        if len(filename_base) > 2 and filename_base[1] == '-': # type: ignore
+        filepath_str: str = str(filepath)
+        filename_base: str = os.path.splitext(os.path.basename(filepath_str))[0]
+        potential_keys: list[str] = [filename_base]
+        if len(filename_base) > 2 and filename_base[1] == '-':
              potential_keys.append(filename_base[2:]) # type: ignore
-        underscore_keys = [k.replace('-', '_') for k in potential_keys] # type: ignore
+        underscore_keys: list[str] = [k.replace('-', '_') for k in potential_keys]
         potential_keys.extend(underscore_keys)
         manager = get_localization_manager()
         selected_key = potential_keys[0]
@@ -1238,15 +1250,15 @@ Hidden=false
                 break
         if selected_key not in manager.widget_translations:
              for key in potential_keys:
-                  clean_key = key.replace('_widget', '').replace('-widget', '') # type: ignore
+                  clean_key: str = key.replace('_widget', '').replace('-widget', '')
                   if clean_key in manager.widget_translations:
                        selected_key = clean_key
                        break
         print(f"DEBUG: Injecting translation for {module_name} using key '{selected_key}'")
         def injected_underscore(message, widget_id=selected_key):
             return _translate_with_patterns_helper(message, widget_id)
-        module._ = injected_underscore # type: ignore
-        module.sudo_manager = get_sudo_manager() # type: ignore
+        setattr(module, '_', injected_underscore)
+        setattr(module, 'sudo_manager', get_sudo_manager())
         filename = os.path.basename(filepath)
         return module, filename
     def _prepare_and_extract_module(self, module, module_name, filepath):
@@ -1581,26 +1593,26 @@ Hidden=false
                 pass
         except Exception:
             pass  
-    def _apply_saved_compact(self):
+    def _apply_saved_compact(self) -> bool:
         """Apply saved compact mode on startup (no animation)."""
         self._set_compact_mode(True, animated=False)
         return False
 
-    def _on_compact_toggle_clicked(self, button):
+    def _on_compact_toggle_clicked(self, button: Any) -> None:
         """Handle manual compact mode toggle button click."""
-        new_compact = not self._compact_mode
+        new_compact: bool = not self._compact_mode
         self._set_compact_mode(new_compact, animated=True)
-        config = _load_config()
+        config: Dict[str, Any] = _load_config()
         config["compact_mode"] = new_compact
         _save_config(config)
 
-    def _on_compact_icon_clicked(self, button):
+    def _on_compact_icon_clicked(self, button: Any) -> None:
         """Handle click on a compact mode icon to select the corresponding widget."""
-        widget_name = button.widget_name
+        widget_name: str = str(getattr(button, 'widget_name', ''))
         # Find the corresponding row in the normal list and activate it
         row = self.widget_list.get_first_child()
         while row:
-            if hasattr(row, 'widget_name') and row.widget_name == widget_name:
+            if hasattr(row, 'widget_name') and getattr(row, 'widget_name', '') == widget_name:
                 self.widget_list.select_row(row)
                 self._on_widget_selected(self.widget_list, row)
                 break
@@ -1608,15 +1620,15 @@ Hidden=false
         # Update compact icon selection styling
         self._update_compact_selection(widget_name)
 
-    def _update_compact_selection(self, selected_name):
+    def _update_compact_selection(self, selected_name: str) -> None:
         """Update visual selection state of compact icon buttons."""
         for btn in self._compact_icon_buttons:
-            if btn.widget_name == selected_name:
+            if getattr(btn, 'widget_name', '') == selected_name:
                 btn.add_css_class("compact-icon-selected")
             else:
                 btn.remove_css_class("compact-icon-selected")
 
-    def _set_compact_mode(self, compact, animated=True):
+    def _set_compact_mode(self, compact: bool, animated: bool=True) -> None:
         """Switch between compact and normal sidebar modes."""
         if self._compact_mode == compact:
             return
@@ -1626,25 +1638,26 @@ Hidden=false
         else:
             self._transition_to_normal(animated)
 
-    def _apply_sidebar_width(self, w):
+    def _apply_sidebar_width(self, w: int) -> None:
         """Set the split view sidebar to exactly w pixels."""
         self.split_view.set_min_sidebar_width(w)
         self.split_view.set_max_sidebar_width(w)
 
-    def _animate_toggle_button(self, target_deg, animated):
+    def _animate_toggle_button(self, target_deg: float, animated: bool) -> None:
         """Animate the compact toggle button rotation to target_deg."""
         if self._btn_rotate_anim is not None:
-            self._btn_rotate_anim.skip()
+            if hasattr(self._btn_rotate_anim, 'skip'):
+                getattr(self._btn_rotate_anim, 'skip')()
             self._btn_rotate_anim = None
         if not animated:
             self._btn_rotation_deg = target_deg
             self._apply_btn_rotation(target_deg)
             return
         start_deg = self._btn_rotation_deg
-        def _on_tick(v):
+        def _on_tick(v: float) -> None:
             self._btn_rotation_deg = v
             self._apply_btn_rotation(v)
-        target = Adw.CallbackAnimationTarget.new(_on_tick)
+        target: Any = Adw.CallbackAnimationTarget.new(_on_tick) # type: ignore
         anim = Adw.TimedAnimation.new(
             self._compact_toggle_btn,
             float(start_deg),
@@ -1656,19 +1669,20 @@ Hidden=false
         self._btn_rotate_anim = anim
         anim.play()
 
-    def _apply_btn_rotation(self, deg):
+    def _apply_btn_rotation(self, deg: float) -> None:
         """Apply rotation transform to the toggle button via CSS."""
         css = f".compact-toggle-btn {{ transition: none; transform: rotate({deg}deg); }}"
         self._btn_css_provider.load_from_data(css.encode())
 
-    def _transition_to_compact(self, animated):
+    def _transition_to_compact(self, animated: bool) -> None:
         """Animate transition to compact mode."""
         selected = self.widget_list.get_selected_row()
         if selected and hasattr(selected, 'widget_name'):
-            self._update_compact_selection(selected.widget_name)
+            selected_name: str = str(getattr(selected, 'widget_name', ''))
+            self._update_compact_selection(selected_name)
         self._animate_toggle_button(0.0, animated)
 
-        def _swap_to_compact():
+        def _swap_to_compact() -> None:
             if hasattr(self, '_sidebar_header_title'):
                 self._sidebar_header_title.set_visible(False)
             self._widget_list_container.set_visible(False)
@@ -1677,23 +1691,24 @@ Hidden=false
 
         if animated:
             if self._sidebar_anim is not None:
-                self._sidebar_anim.skip()
+                if hasattr(self._sidebar_anim, 'skip'):
+                    getattr(self._sidebar_anim, 'skip')()
                 self._sidebar_anim = None
             # Swap content at the midpoint of the width animation
             mid = (SIDEBAR_WIDTH + SIDEBAR_COMPACT_WIDTH) / 2.0
-            swapped = [False]
-            def _on_tick(v):
+            swapped: list[bool] = [False]
+            def _on_tick(v: float) -> None:
                 self._apply_sidebar_width(int(v))
                 if not swapped[0] and v <= mid:
                     swapped[0] = True
                     _swap_to_compact()
-            target = Adw.CallbackAnimationTarget.new(_on_tick)
+            target_anim: Any = Adw.CallbackAnimationTarget.new(_on_tick) # type: ignore
             anim = Adw.TimedAnimation.new(
                 self.split_view,
                 float(SIDEBAR_WIDTH),
                 float(SIDEBAR_COMPACT_WIDTH),
                 COMPACT_ANIM_DURATION,
-                target
+                target_anim
             )
             anim.set_easing(Adw.Easing.EASE_IN_OUT_CUBIC)
             self._sidebar_anim = anim
@@ -1702,11 +1717,11 @@ Hidden=false
             _swap_to_compact()
             self._apply_sidebar_width(SIDEBAR_COMPACT_WIDTH)
 
-    def _transition_to_normal(self, animated):
+    def _transition_to_normal(self, animated: bool) -> None:
         """Animate transition to normal mode."""
         self._animate_toggle_button(180.0, animated)
 
-        def _swap_to_normal():
+        def _swap_to_normal() -> None:
             if hasattr(self, '_sidebar_header_title'):
                 self._sidebar_header_title.set_visible(True)
             self._widget_list_container.set_visible(True)
@@ -1715,25 +1730,26 @@ Hidden=false
 
         if animated:
             if self._sidebar_anim is not None:
-                self._sidebar_anim.skip()
+                if hasattr(self._sidebar_anim, 'skip'):
+                    getattr(self._sidebar_anim, 'skip')()
                 self._sidebar_anim = None
             # Swap content at the midpoint of the width animation
             mid = (SIDEBAR_WIDTH + SIDEBAR_COMPACT_WIDTH) / 2.0
-            swapped = [False]
-            def _on_tick(v):
+            swapped: list[bool] = [False]
+            def _on_tick(v: float) -> None:
                 self._apply_sidebar_width(int(v))
                 if not swapped[0] and v >= mid:
                     swapped[0] = True
                     _swap_to_normal()
-            def _on_done(anim):
+            def _on_done(anim_done: Any) -> None:
                 self._sidebar_anim = None
-            target = Adw.CallbackAnimationTarget.new(_on_tick)
+            target_anim: Any = Adw.CallbackAnimationTarget.new(_on_tick) # type: ignore
             anim = Adw.TimedAnimation.new(
                 self.split_view,
                 float(SIDEBAR_COMPACT_WIDTH),
                 float(SIDEBAR_WIDTH),
                 COMPACT_ANIM_DURATION,
-                target
+                target_anim
             )
             anim.set_easing(Adw.Easing.EASE_IN_OUT_CUBIC)
             anim.connect("done", _on_done)
@@ -1879,54 +1895,86 @@ Hidden=false
         )
 class WidgetLoaderApp(Adw.Application):
     """Main application class."""
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any):
         flags = Gio.ApplicationFlags.NON_UNIQUE if os.environ.get("LINEXIN_NEW_INSTANCE") else Gio.ApplicationFlags.FLAGS_NONE
-        super().__init__(application_id=APP_ID, flags=flags, **kwargs) # type: ignore
+        super().__init__(application_id=APP_ID, flags=flags) # type: ignore
         self.connect('activate', self.on_activate)
-        self.hide_sidebar = False
-        self.target_widget = None
-        self.voice_autostart = False
+        self.hide_sidebar: bool = False
+        self.target_widget: Optional[str] = None
+        self.voice_autostart: bool = False
+        self.window: Optional[WidgetLoaderWindow] = None
         self._parse_arguments()
     def _parse_arguments(self):
         """Parse command line arguments manually."""
         import sys
         print(f"Command line arguments: {sys.argv}")
-        new_argv: list[str] = [sys.argv[0]]  
-        i: int = 1  
-        while i < len(sys.argv):
-            arg = sys.argv[i]
+        new_argv: list[str] = []
+        
+        args_iter = iter(sys.argv)
+        
+        try:
+            first_arg: str = next(args_iter)
+            new_argv.append(str(first_arg))
+        except StopIteration:
+            pass
+            
+        while True:
+            try:
+                arg: str = next(args_iter)
+            except StopIteration:
+                break
+                
             if arg == '--widget' or arg == '-w':
-                if i + 1 < len(sys.argv): # type: ignore
-                    self.target_widget = str(sys.argv[i + 1]) # type: ignore
+                try:
+                    target_arg: str = next(args_iter)
+                    self.target_widget = str(target_arg)
                     self.hide_sidebar = True
                     print(f"Found widget argument: {self.target_widget}")
-                    i += 2 # type: ignore 
-                    continue
-                else:
+                except StopIteration:
                     print("Error: --widget requires a widget name")
                     sys.exit(1)
             elif arg == '--voice':
                 self.voice_autostart = True
-                i += 1
-                continue
             elif arg == '--version' or arg == '-v':
                 print(f"Linexin Tools v{APP_VERSION}")
                 sys.exit(0)
             else:
                 new_argv.append(str(arg))
-                i += 1
-        sys.argv = new_argv
+                
+        sys.argv.clear()
+        sys.argv.extend(new_argv)
         print(f"Cleaned arguments for GTK: {sys.argv}")
         print(f"Final settings: hide_sidebar={self.hide_sidebar}, target_widget={self.target_widget}, voice_autostart={self.voice_autostart}")
-    def on_activate(self, app):
+
+    def on_activate(self, app: Adw.Application) -> None:
         """Handle application activation."""
-        self.window = WidgetLoaderWindow(
+        window_instance = WidgetLoaderWindow(
             application=app,
             hide_sidebar=self.hide_sidebar,
             target_widget=self.target_widget,
             voice_autostart=self.voice_autostart
         )
-        self.window.present()
+        self.window = window_instance
+        window_instance.present()
+
+        def _sigusr1_handler(signum, frame):
+            """Reactivate voice input on the active widget when SIGUSR1 is received."""
+            GLib.idle_add(self._reactivate_voice)
+
+        signal.signal(signal.SIGUSR1, _sigusr1_handler)
+
+    def _reactivate_voice(self):
+        """Reactivate voice input on the active widget."""
+        win = self.window
+        if win and hasattr(win, 'active_widget'):
+            widget = win.active_widget
+            if widget and hasattr(widget, 'stt_toggle'):
+                toggle = widget.stt_toggle
+                # Deactivate first if already active so re-toggling restarts STT
+                if toggle.get_active():
+                    toggle.set_active(False)
+                toggle.set_active(True)
+        return False  # Don't repeat the GLib idle callback
 def main():
     """Application entry point."""
     app = WidgetLoaderApp()

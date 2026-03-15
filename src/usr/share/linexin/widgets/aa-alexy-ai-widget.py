@@ -32,7 +32,7 @@ except Exception:
 CONFIG_DIR = os.path.expanduser("~/.config/linexin-center")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "ai-sysadmin.json")
 CONVERSATIONS_DIR = os.path.join(CONFIG_DIR, "conversations")
-BUNDLED_THEMES_DIR = "/usr/share/linexin/widgets/themes/alexy/"
+BUNDLED_THEMES_DIR = "/usr/share/linexin/widgets/themes/"
 USER_THEMES_DIR = os.path.join(CONFIG_DIR, "themes")
 
 class SudoManager:
@@ -537,7 +537,7 @@ class LinexinAISysadminWidget(Gtk.Box):
         
         # Voice-to-Text Config
         self.stt_backend = "whisper"  # "whisper" or "vosk"
-        self.whisper_model = "base"  # tiny, base, small, medium
+        self.whisper_model = "small"  # tiny, base, small, medium
         self.vosk_lang = "small-en-us-0.15"
         self.hey_linux_enabled = False
         
@@ -563,6 +563,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             "If there is no flatpak version of what the user is asking for, you should then ONLY use the system package manager to fulfil the request. "
             "If the user wants you to run any program, you should first check if it is installed by searching both installed system packages and installed flatpaks. If it is not installed, you should tell the user that it is not installed and ask them if they want you to install it. "
             "If you need to launch a GUI application, you MUST run it in the background disconnected from stdout like this: `nohup app_name >/dev/null 2>&1 & disown` so it does not block the terminal. "
+            "Try to use commands without sudo whenever possible, but if you need to perform a privileged action, you can use sudo. "
             "You may run multiple queries in sequence. Once you have all the information necessary, provide a final conversational response WITHOUT any bash blocks. "
         )
         self.chat_history = []
@@ -1046,7 +1047,7 @@ class LinexinAISysadminWidget(Gtk.Box):
                     self.local_model = config.get("local_model", self.local_model)
                     self.system_prompt = config.get("system_prompt", self.system_prompt)
                     self.stt_backend = config.get("stt_backend", "whisper")
-                    self.whisper_model = config.get("whisper_model", "base")
+                    self.whisper_model = config.get("whisper_model", "small")
                     self.vosk_lang = config.get("vosk_lang", "small-en-us-0.15")
                     self.hey_linux_enabled = config.get("hey_linux_enabled", False)
                     self.voice_correction_direct = config.get("voice_correction_direct", False)

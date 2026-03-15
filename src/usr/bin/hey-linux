@@ -258,9 +258,15 @@ def main():
             if listen_for_wake_word(oww_model, threshold):
                 # Only launch if the previously launched instance is no longer running
                 if launched_proc is not None and launched_proc.poll() is None:
-                    print("[hey-linux] Linexin Center is already running, ignoring.")
+                    # App is already running — send SIGUSR1 to reactivate voice input
+                    try:
+                        os.kill(launched_proc.pid, signal.SIGUSR1)
+                        print("[hey-linux] Sent SIGUSR1 to reactivate voice input.")
+                        send_notification("Hey Alexy", "Reactivating voice input...")
+                    except OSError as e:
+                        print(f"[hey-linux] Failed to signal running instance: {e}")
                 else:
-                    send_notification("Hey Linux", "Activating AI assistant...")
+                    send_notification("Hey Alexy", "Activating AI assistant...")
                     launched_proc = launch_widget()
 
                 # Debounce: wait for scores to drop so the same
