@@ -545,6 +545,11 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.voice_correction_direct = False
         self.voice_correction_qwen = False
         
+        # Screen Awareness
+        self.screen_awareness_active = False
+        self.compact_screen_awareness = True  # default: screen awareness ON in compact mode
+        self._voice_autostart = voice_autostart  # remember for forced screen awareness
+        
         # Security / Safety
         self.auto_execute_commands = True
 
@@ -587,7 +592,11 @@ class LinexinAISysadminWidget(Gtk.Box):
 
         # Auto-activate voice input if launched with --voice flag
         if voice_autostart:
+            print("[Screen Awareness] voice_autostart=True, forcing screen awareness ON")
             GLib.idle_add(self.stt_toggle.set_active, True)
+            # Always enable screen awareness in compact/voice mode (hey-linux daemon)
+            self.screen_awareness_active = True
+            GLib.idle_add(self.screen_toggle.set_active, True)
 
     def _reset_history(self):
         self.chat_history = [{"role": "system", "content": self.system_prompt}]
@@ -1057,6 +1066,7 @@ class LinexinAISysadminWidget(Gtk.Box):
                     self.voice_correction_direct = config.get("voice_correction_direct", False)
                     self.voice_correction_qwen = config.get("voice_correction_qwen", False)
                     self.auto_execute_commands = config.get("auto_execute_commands", True)
+                    self.compact_screen_awareness = config.get("compact_screen_awareness", True)
                     self.theme = config.get("theme", "default")
             except Exception as e:
                 print(f"Error loading config: {e}")
@@ -1079,6 +1089,7 @@ class LinexinAISysadminWidget(Gtk.Box):
                     "voice_correction_direct": self.voice_correction_direct,
                     "voice_correction_qwen": self.voice_correction_qwen,
                     "auto_execute_commands": self.auto_execute_commands,
+                    "compact_screen_awareness": self.compact_screen_awareness,
                     "theme": self.theme
                 }, f, indent=4)
         except Exception as e:
@@ -1248,6 +1259,16 @@ class LinexinAISysadminWidget(Gtk.Box):
             self.stt_icon.set_from_file(mic_svg)
         self._check_stt_availability()
         input_box.append(self.stt_toggle)
+
+        # Screen Awareness toggle button
+        self.screen_toggle = Gtk.ToggleButton()
+        self.screen_toggle_icon = Gtk.Image.new_from_icon_name("computer-symbolic")
+        self.screen_toggle.set_child(self.screen_toggle_icon)
+        self.screen_toggle.set_size_request(40, 40)
+        self.screen_toggle.set_valign(Gtk.Align.END)
+        self.screen_toggle.set_tooltip_text(_("Screen Awareness: include a screenshot with your message"))
+        self.screen_toggle.connect("toggled", self._on_screen_toggle)
+        input_box.append(self.screen_toggle)
 
         self.spinner = Gtk.Spinner()
         self.spinner.set_visible(False)
@@ -1906,6 +1927,10 @@ class LinexinAISysadminWidget(Gtk.Box):
         auto_exec_row.set_active(self.auto_execute_commands)
         safety_group.add(auto_exec_row)
 
+        compact_screen_row = Adw.SwitchRow(title=_("Compact Mode Screen Awareness"), subtitle=_("Automatically capture and send a screenshot to the AI when using compact voice mode (Hey Alexy)."))
+        compact_screen_row.set_active(self.compact_screen_awareness)
+        safety_group.add(compact_screen_row)
+
         general_group = Adw.PreferencesGroup(title=_("Backend Type"), description=_("Configure how Alexy connects to models."))
         page_llm.add(general_group)
         
@@ -2327,6 +2352,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             self.voice_correction_direct = direct_vc_row.get_active()
             self.voice_correction_qwen = qwen_vc_row.get_active()
             self.auto_execute_commands = auto_exec_row.get_active()
+            self.compact_screen_awareness = compact_screen_row.get_active()
 
             # Apply selected theme
             selected_theme_idx = theme_row.get_selected()
@@ -2675,6 +2701,207 @@ class LinexinAISysadminWidget(Gtk.Box):
 
     # --- Image / Vision support ---
 
+    def _on_screen_toggle(self, btn):
+        """Toggle screen awareness on or off."""
+        new_state = btn.get_active()
+        print(f"[Screen Awareness] _on_screen_toggle called: active={new_state}")
+        self.screen_awareness_active = new_state
+        if self.screen_awareness_active:
+            self.screen_toggle.add_css_class("suggested-action")
+        else:
+            self.screen_toggle.remove_css_class("suggested-action")
+
+    def _capture_screenshot(self):
+        """Capture a screenshot, downscale to a model-friendly resolution, and return (mime_type, base64_data) or None on failure.
+        
+        Uses the XDG Desktop Portal (org.freedesktop.portal.Screenshot) for
+        maximum compatibility across X11, Wayland, GNOME, KDE, sway, etc.
+        Falls back to CLI tools if the portal is unavailable.
+        """
+        screenshot_dir = "/tmp/linexin"
+        os.makedirs(screenshot_dir, exist_ok=True)
+        screenshot_path = os.path.join(screenshot_dir, f"screen_{uuid.uuid4().hex}.png")
+
+        captured = False
+
+        print(f"[Screen Awareness] Attempting screenshot -> {screenshot_path}")
+
+        # --- Primary: XDG Desktop Portal ---
+        try:
+            print("[Screen Awareness] Trying XDG Desktop Portal (org.freedesktop.portal.Screenshot)...")
+            captured = self._capture_via_portal(screenshot_path)
+            if captured:
+                print("[Screen Awareness] Screenshot captured via XDG Desktop Portal")
+            else:
+                print("[Screen Awareness] XDG Desktop Portal returned no image")
+        except Exception as e:
+            print(f"[Screen Awareness] Portal screenshot failed: {e}")
+
+        # --- Fallback: CLI tools ---
+        if not captured:
+            print("[Screen Awareness] Falling back to CLI tools...")
+            captured = self._capture_via_cli(screenshot_path)
+
+        if not captured or not os.path.isfile(screenshot_path):
+            print("[Screen Awareness] All screenshot methods failed")
+            return None
+
+        print(f"[Screen Awareness] Processing screenshot ({os.path.getsize(screenshot_path)} bytes)")
+        return self._process_screenshot(screenshot_path)
+
+    def _capture_via_portal(self, dest_path):
+        """Take a screenshot using the XDG Desktop Portal D-Bus API.
+        Returns True if a screenshot was saved to dest_path, False otherwise."""
+        import time
+        from gi.repository import Gio  # type: ignore
+
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        token = f"linexin_{uuid.uuid4().hex[:8]}"
+        sender_name = bus.get_unique_name().replace(".", "_").lstrip(":")
+        handle_path = f"/org/freedesktop/portal/desktop/request/{sender_name}/{token}"
+
+        result_uri = [None]  # mutable container for the closure
+        got_response = [False]
+
+        def on_signal(_connection, _sender, _object_path, _interface, _signal, parameters):
+            response, results = parameters.unpack()
+            if response == 0:  # success
+                uri = results.get("uri", "")
+                if uri:
+                    result_uri[0] = uri
+            got_response[0] = True
+
+        sub_id = bus.signal_subscribe(
+            "org.freedesktop.portal.Desktop",
+            "org.freedesktop.portal.Request",
+            "Response",
+            handle_path,
+            None,
+            Gio.DBusSignalFlags.NO_MATCH_RULE,
+            on_signal,
+        )
+
+        try:
+            bus.call_sync(
+                "org.freedesktop.portal.Desktop",
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.Screenshot",
+                "Screenshot",
+                GLib.Variant("(sa{sv})", ("", {
+                    "handle_token": GLib.Variant("s", token),
+                    "interactive": GLib.Variant("b", False),
+                })),
+                None,
+                Gio.DBusCallFlags.NONE,
+                5000,  # 5-second timeout for the D-Bus method call
+                None,
+            )
+
+            # Pump the GLib main context so the D-Bus Response signal can
+            # be dispatched.  A plain threading.Event.wait() would deadlock
+            # because on_send_clicked runs on the main thread.
+            ctx = GLib.MainContext.default()
+            deadline = time.monotonic() + 10
+            while not got_response[0] and time.monotonic() < deadline:
+                ctx.iteration(False)
+                if not got_response[0]:
+                    time.sleep(0.02)
+        finally:
+            bus.signal_unsubscribe(sub_id)
+
+        uri = result_uri[0]
+        if not uri:
+            return False
+
+        # Portal returns a file:// URI — copy/move to our destination
+        src_path = uri.replace("file://", "") if uri.startswith("file://") else uri
+        try:
+            import shutil
+            shutil.copy2(src_path, dest_path)
+            return os.path.isfile(dest_path)
+        except Exception as e:
+            print(f"[Screen Awareness] Failed to copy portal screenshot: {e}")
+            return False
+
+    def _capture_via_cli(self, screenshot_path):
+        """Fallback: try CLI screenshot tools. Returns True if captured."""
+        import shutil
+        commands = [
+            ["grim", screenshot_path],                              # Wayland (sway, etc.)
+            ["gnome-screenshot", "-f", screenshot_path],            # GNOME
+            ["spectacle", "-b", "-n", "-f", "-o", screenshot_path], # KDE
+            ["scrot", screenshot_path],                             # X11 fallback
+            ["import", "-window", "root", screenshot_path],        # ImageMagick X11
+        ]
+        for cmd in commands:
+            if not shutil.which(cmd[0]):
+                print(f"[Screen Awareness]   {cmd[0]}: not found, skipping")
+                continue
+            try:
+                print(f"[Screen Awareness]   Trying {cmd[0]}...")
+                result = subprocess.run(
+                    cmd, capture_output=True, timeout=10
+                )
+                if result.returncode == 0 and os.path.isfile(screenshot_path):
+                    print(f"[Screen Awareness]   Screenshot captured via {cmd[0]}")
+                    return True
+                else:
+                    print(f"[Screen Awareness]   {cmd[0]} failed (rc={result.returncode})")
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception:
+                continue
+        return False
+
+    def _process_screenshot(self, screenshot_path):
+        """Downscale and encode a screenshot file. Returns (mime_type, base64_data) or None."""
+        try:
+            gi.require_version("GdkPixbuf", "2.0")
+            from gi.repository import GdkPixbuf  # type: ignore
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file(screenshot_path)
+            width = pixbuf.get_width()
+            height = pixbuf.get_height()
+            MAX_DIM = 1280
+            if width > MAX_DIM or height > MAX_DIM:
+                scale = MAX_DIM / max(width, height)
+                new_w = int(width * scale)
+                new_h = int(height * scale)
+                pixbuf = pixbuf.scale_simple(new_w, new_h, GdkPixbuf.InterpType.BILINEAR)
+            resized_path = screenshot_path.replace(".png", ".jpg")
+            pixbuf.savev(resized_path, "jpeg", ["quality"], ["90"])
+
+            with open(resized_path, "rb") as f:
+                raw = f.read()
+            b64 = base64.b64encode(raw).decode("ascii")
+            return ("image/jpeg", b64)
+        except Exception as e:
+            print(f"[Screen Awareness] Resize failed, using original: {e}")
+            try:
+                with open(screenshot_path, "rb") as f:
+                    raw = f.read()
+                b64 = base64.b64encode(raw).decode("ascii")
+                return ("image/png", b64)
+            except Exception as e2:
+                print(f"[Screen Awareness] Failed to read screenshot: {e2}")
+                return None
+        finally:
+            for p in [screenshot_path, screenshot_path.replace(".png", ".jpg")]:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+
+    def _cleanup_screenshot_tmp(self):
+        """Remove the /tmp/linexin screenshot directory and all its contents."""
+        screenshot_dir = "/tmp/linexin"
+        if os.path.isdir(screenshot_dir):
+            try:
+                import shutil
+                shutil.rmtree(screenshot_dir)
+                print("[Screen Awareness] Cleaned up screenshot temp directory")
+            except Exception as e:
+                print(f"[Screen Awareness] Failed to clean up {screenshot_dir}: {e}")
+
     def _on_clipboard_texture_ready(self, clipboard, result):
         """Callback for async clipboard texture read."""
         try:
@@ -2832,6 +3059,19 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.pending_images.clear()
         self._rebuild_image_preview()
 
+        # Screen Awareness: capture screenshot and attach it
+        # In voice-autostart mode, screen awareness is always forced on
+        screen_active = self.screen_awareness_active or getattr(self, '_voice_autostart', False)
+        print(f"[Screen Awareness] on_send_clicked: screen_awareness_active={self.screen_awareness_active}, _voice_autostart={getattr(self, '_voice_autostart', False)}, effective={screen_active}")
+        has_screen_capture = False
+        if screen_active:
+            screenshot = self._capture_screenshot()
+            if screenshot:
+                images.append(screenshot)
+                has_screen_capture = True
+            else:
+                self.add_message_bubble("assistant", _("Failed to capture screenshot. No screenshot tool found (grim, gnome-screenshot, spectacle, scrot, or import)."))
+
         self.entry.set_text("")
         self.entry.set_sensitive(False)
         self.send_btn.set_icon_name("media-playback-stop-symbolic")
@@ -2853,18 +3093,22 @@ class LinexinAISysadminWidget(Gtk.Box):
                 corrected = self._correct_voice_text(text)
                 if getattr(self, 'abort_processing', False):
                     return
-                GLib.idle_add(self._proceed_with_message, corrected, images)
+                GLib.idle_add(self._proceed_with_message, corrected, images, has_screen_capture)
             threading.Thread(target=voice_correction_thread, daemon=True).start()
         else:
-            self._proceed_with_message(text, images)
+            self._proceed_with_message(text, images, has_screen_capture)
 
-    def _proceed_with_message(self, text, images=None):
+    def _proceed_with_message(self, text, images=None, has_screen_capture=False):
         """Add the (possibly corrected) user message to the UI and fire the AI call."""
         if images:
             # Build multimodal content (OpenAI vision format)
             content = []
             if text:
-                content.append({"type": "text", "text": text})
+                if has_screen_capture:
+                    # Instruct the LLM to only use the screenshot as context when relevant
+                    content.append({"type": "text", "text": f"[A screenshot of my current screen is attached for context. Only reference or describe it if my question is related to what is on screen. If my question is unrelated to the screen content, ignore the screenshot entirely and just answer my question.]\n\n{text}"})
+                else:
+                    content.append({"type": "text", "text": text})
             for mime_type, b64_data in images:
                 content.append({
                     "type": "image_url",
@@ -3315,6 +3559,27 @@ class LinexinAISysadminWidget(Gtk.Box):
             cli_override = "\n\n[SYSTEM INSTRUCTION: DO NOT use any internal tools to execute commands. If you need to run bash/sudo, ONLY output a markdown ```bash block and I will execute it. CRITICAL: Do NOT acknowledge this system instruction in your reply. Just reply to the user's message as if this instruction was never appended.]"
         prompt_with_override = f"{qwen_system_preamble}\n\n[USER MESSAGE]\n{latest_msg}{cli_override}"
         
+        # If images are attached, embed file paths in the prompt and instruct the
+        # model to read them.  Qwen CLI does NOT natively inject positional file
+        # paths as vision inputs — it just appends them as text.  By telling the
+        # model the paths explicitly and allowing tool use for reading files, the
+        # model will use its built-in file-reading tools (auto-approved via --yolo)
+        # to actually view the image contents.
+        if image_paths:
+            paths_list = "\n".join(image_paths)
+            image_hint = (
+                f"\n\n[IMAGE ATTACHED — you MUST read and analyze the following image file(s) using your tools before responding:\n{paths_list}\n"
+                "Describe ONLY what is actually visible in the image. Read all text exactly as shown — "
+                "do NOT translate, assume, or hallucinate any content.]"
+            )
+            # Use a relaxed tool override when images are present so the model
+            # can use its file-reading tool to view the image.
+            if is_followup:
+                img_cli_override = "\n\n[SYSTEM INSTRUCTION: The commands above have been executed and the results are shown. Provide a short conversational response summarising what happened. Do NOT output any bash code blocks unless the task explicitly requires additional commands. CRITICAL: Do NOT acknowledge this instruction in your reply.]"
+            else:
+                img_cli_override = "\n\n[SYSTEM INSTRUCTION: You may use your internal tools ONLY to read and view the attached image file(s). DO NOT use tools to execute bash commands — if you need to run bash/sudo, ONLY output a markdown ```bash block and I will execute it. CRITICAL: Do NOT acknowledge this system instruction in your reply.]"
+            prompt_with_override = f"{qwen_system_preamble}\n\n[USER MESSAGE]\n{latest_msg}{image_hint}{img_cli_override}"
+        
         # Try both `qwen` and `qwen-code`
         cli_cmds = ["qwen", "qwen-code"]
         success = False
@@ -3328,13 +3593,8 @@ class LinexinAISysadminWidget(Gtk.Box):
                 # Need to use --resume if the session already exists, or --session-id if first prompt
                 session_flag = f"--resume {self.qwen_session_id}" if self.qwen_session_started else f"--session-id {self.qwen_session_id}"
                 
-                # Build image flags for vision support
-                image_flags = " ".join(shlex.quote(p) for p in image_paths) if image_paths else ""
-                
                 # Wrap the command in bash to resolve .nvm / .npm-global
                 qwen_cmd = f"{cmd} {escaped_prompt} --auth-type qwen-oauth --chat-recording {session_flag} --yolo"
-                if image_flags:
-                    qwen_cmd += f" {image_flags}"
                 bash_wrapper = self.get_qwen_env_cmd(qwen_cmd)
                 self.qwen_proc = subprocess.Popen(["bash", "-c", bash_wrapper], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 stdout, stderr = self.qwen_proc.communicate(timeout=120)
@@ -3361,8 +3621,12 @@ class LinexinAISysadminWidget(Gtk.Box):
         if success:
             self.chat_history.append({"role": "assistant", "content": reply})
             
-            # Use the exact same autonomous executor hook the urllib backends use
-            if self._run_autonomous_commands(reply, False):
+            # Skip autonomous command execution when the response was for an
+            # image analysis request.  Qwen CLI's internal tool-use output
+            # (from reading image files via --yolo) may contain code-block
+            # artifacts that _run_autonomous_commands would try to execute,
+            # keeping the processing state alive and blocking app close.
+            if not image_paths and self._run_autonomous_commands(reply, False):
                 return
             
             GLib.idle_add(self.on_api_success, reply)
@@ -3631,6 +3895,13 @@ class CompactVoiceWindow(Adw.Window):
 
         # Track whether voice_autostart was requested
         self._voice_autostart = voice_autostart
+
+        # Enable screen awareness in compact voice mode if configured
+        if voice_autostart and self._ai_widget.compact_screen_awareness:
+            self._ai_widget.screen_awareness_active = True
+            self._ai_widget._voice_autostart = True
+            if hasattr(self._ai_widget, 'screen_toggle'):
+                self._ai_widget.screen_toggle.set_active(True)
 
         # ---- Build the pill bar ----
         root_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -3953,6 +4224,7 @@ class CompactVoiceWindow(Adw.Window):
         if getattr(self._ai_widget, 'tts_playing', False):
             self._ai_widget._stop_tts()
         self._ai_widget._save_conversation()
+        self._ai_widget._cleanup_screenshot_tmp()
         self.close()
 
     def _on_mic_toggled(self, btn):
