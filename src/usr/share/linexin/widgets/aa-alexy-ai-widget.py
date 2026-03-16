@@ -2,6 +2,7 @@
 import gi # type: ignore # pylint: disable=import-error
 import os
 import json
+import re as _re
 import urllib.request
 import urllib.error
 import threading
@@ -194,6 +195,131 @@ class SudoManager:
         except:
             pass
 
+class _OAuthPopupWindow(Adw.Window):
+    """Minimal popup for OAuth flows — no URL bar, no controls."""
+    def __init__(self, parent, url, on_closed_without_auth=None, auth_file=None):
+        super().__init__(title=_("Qwen CLI Login"), transient_for=parent, modal=True) # type: ignore
+        self.set_default_size(500, 650)
+        self.auth_file = auth_file or os.path.expanduser("~/.qwen/oauth_creds.json")
+        self.on_closed_without_auth = on_closed_without_auth
+        self.authenticated = False
+        self._browser_proc = None
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_content(box)
+        header = Adw.HeaderBar()
+        box.append(header)
+
+        # Try WebKitGTK first (embedded, best UX)
+        embedded = False
+        try:
+            gi.require_version("WebKit", "6.0") # type: ignore
+            from gi.repository import WebKit # type: ignore # pylint: disable=import-error
+            self.webview = WebKit.WebView()
+            self.webview.set_vexpand(True)
+            self.webview.set_hexpand(True)
+            box.append(self.webview)
+            self.webview.load_uri(url)
+            embedded = True
+        except Exception:
+            pass
+
+        if not embedded:
+            import shutil
+            browser_bin = None
+            browser_args = []
+            track_process = True  # whether we can rely on process exit to detect close
+
+            # Try Chromium/Chrome --app mode (minimal window, no URL bar)
+            for ch in ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome", "brave-browser", "microsoft-edge-stable"]:
+                found = shutil.which(ch)
+                if found:
+                    browser_bin = found
+                    browser_args = [f"--app={url}", "--no-first-run", "--disable-extensions"]
+                    break
+
+            # Fallback: Firefox in a new window.
+            # Firefox delegates to the running instance and exits immediately,
+            # so we cannot track the process — rely on auth-file polling only.
+            if not browser_bin:
+                for ff in ["firefox", "firefox-esr"]:
+                    found = shutil.which(ff)
+                    if found:
+                        browser_bin = found
+                        browser_args = ["--new-window", url]
+                        track_process = False
+                        break
+
+            # Other browsers (trackable process)
+            if not browser_bin:
+                for br in ["epiphany", "falkon"]:
+                    found = shutil.which(br)
+                    if found:
+                        browser_bin = found
+                        browser_args = [url]
+                        break
+
+            if browser_bin:
+                status = Gtk.Label(label=_("Complete the login in your browser, then close this window."))
+                status.set_wrap(True)
+                status.set_margin_top(24)
+                status.set_margin_start(12)
+                status.set_margin_end(12)
+                box.append(status)
+                self._browser_proc = subprocess.Popen(
+                    [browser_bin] + browser_args,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                if track_process:
+                    GLib.timeout_add(1000, self._check_browser_closed)
+            else:
+                # Last resort: xdg-open (full browser, can't track window close)
+                status = Gtk.Label(label=_("Complete the login in your browser, then close this window."))
+                status.set_wrap(True)
+                status.set_margin_top(24)
+                status.set_margin_start(12)
+                status.set_margin_end(12)
+                box.append(status)
+                subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        self.connect("close-request", self._on_close)
+        GLib.timeout_add(500, self._poll_auth)
+
+    def _check_browser_closed(self):
+        """Monitor the --app browser process; if user closes it, close this window."""
+        if self.authenticated:
+            return False
+        if self._browser_proc and self._browser_proc.poll() is not None:
+            if not self.authenticated:
+                self.close()
+            return False
+        return True
+
+        self.connect("close-request", self._on_close)
+        GLib.timeout_add(500, self._poll_auth)
+
+    def _poll_auth(self):
+        if self.authenticated:
+            return False
+        try:
+            if os.path.exists(self.auth_file):
+                with open(self.auth_file, 'r') as f:
+                    data = f.read().strip()
+                if len(data) > 10:
+                    self.authenticated = True
+                    self.close()
+                    return False
+        except Exception:
+            pass
+        return True
+
+    def _on_close(self, win):
+        if self._browser_proc and self._browser_proc.poll() is None:
+            self._browser_proc.terminate()
+        if not self.authenticated and self.on_closed_without_auth:
+            self.on_closed_without_auth()
+        return False
+
 class _ActionProgressWindow(Adw.Window):
     def __init__(self, parent=None, title="", cmd_string="", is_ollama=False, initial_status=None, on_close_callback=None, poll_auth_file=False, sudo_manager=None, model_name=None, **kwargs):
         if not cmd_string:
@@ -211,6 +337,18 @@ class _ActionProgressWindow(Adw.Window):
         self.process: Optional[subprocess.Popen[str]] = None
         self.sudo_manager = sudo_manager
         self.connect("close-request", self.handle_close)
+        self._oauth_popup = None
+        self._last_error_line = None
+
+        # Detect WebKitGTK once so we know whether to embed or delegate to CLI
+        self._has_webkit = False
+        if self.poll_auth_file:
+            try:
+                gi.require_version("WebKit", "6.0")  # type: ignore
+                from gi.repository import WebKit  # type: ignore # noqa: F401 pylint: disable=import-error,unused-import
+                self._has_webkit = True
+            except Exception:
+                pass
         
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_content(box)
@@ -263,13 +401,34 @@ class _ActionProgressWindow(Adw.Window):
                 self.sudo_manager.start_privileged_session()
                 cmd_args = [self.sudo_manager.wrapper_path] + cmd_args
                 
+            env = None
+            self._noop_browser_dir = None
+            if self.poll_auth_file and self._has_webkit:
+                # Suppress ALL browser launches from the CLI subprocess so only
+                # our embedded WebKit popup opens.  Node.js 'open' uses xdg-open
+                # on Linux and ignores $BROWSER, so we must shadow the actual
+                # browser binaries with a no-op script in PATH.
+                env = os.environ.copy()
+                env["BROWSER"] = "/bin/true"
+                noop_dir = tempfile.mkdtemp(prefix="linexin-noop-")
+                noop_script = os.path.join(noop_dir, "xdg-open")
+                with open(noop_script, "w") as _f:
+                    _f.write("#!/bin/sh\nexit 0\n")
+                os.chmod(noop_script, 0o700)
+                # Shadow common browser binaries too (some CLIs call them directly)
+                for _name in ["firefox", "firefox-esr", "chromium", "google-chrome-stable", "sensible-browser"]:
+                    os.symlink(noop_script, os.path.join(noop_dir, _name))
+                env["PATH"] = noop_dir + ":" + env.get("PATH", "")
+                self._noop_browser_dir = noop_dir
+            
             self.process = subprocess.Popen(
                 cmd_args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
+                env=env
             )
             
             process = self.process
@@ -285,14 +444,27 @@ class _ActionProgressWindow(Adw.Window):
             
             if self.sudo_manager:
                 self.sudo_manager.stop_privileged_session()
+            self._cleanup_noop_dir()
                 
             GLib.idle_add(self.on_finish, process.returncode if process else 1)
         except Exception as e:
             self.process_finished = True
             if self.sudo_manager:
                 self.sudo_manager.stop_privileged_session()
+            self._cleanup_noop_dir()
             print(f"Error launching process: {str(e)}")
             GLib.idle_add(self.status_label.set_label, _("Process failed to start."))
+
+    def _cleanup_noop_dir(self):
+        """Remove the temporary no-op browser directory."""
+        d = getattr(self, '_noop_browser_dir', None)
+        if d and os.path.isdir(d):
+            try:
+                import shutil
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+            self._noop_browser_dir = None
 
     def parse_and_append(self, line):
         # Print raw output to the shell for debugging
@@ -310,6 +482,47 @@ class _ActionProgressWindow(Adw.Window):
         
         if not filtered_line:
             return False
+        
+        # Filter out progress bar lines (curl ##, npm progress, spinners)
+        if re.match(r'^[#\s.]+$', filtered_line):
+            return False
+        if re.match(r'^[\\|/\-⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏\s]+$', filtered_line):
+            return False
+        # Filter out npm progress lines like '⸩ ⠏' or bare percentage lines
+        if re.match(r'^[⸩⸨()\[\]#=>.\-\s⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]+$', filtered_line):
+            return False
+        
+        # Intercept OAuth URLs
+        if self.poll_auth_file and not self._oauth_popup:
+            # Capture error messages from the CLI for better reporting
+            lower = filtered_line.lower()
+            if 'failed' in lower or 'error' in lower:
+                self._last_error_line = filtered_line
+            
+            url_match = re.search(r'https?://\S+', filtered_line)
+            if url_match:
+                url = url_match.group(0)
+                self.status_label.set_label(_("Waiting for authorization to complete..."))
+                if self._has_webkit:
+                    # WebKitGTK available → open embedded popup (CLI browser suppressed)
+                    def on_popup_closed_without_auth():
+                        self.success = False
+                        self.process_finished = True
+                        process = self.process
+                        if process:
+                            process.terminate()
+                        self.status_label.set_label(_("Authorization was cancelled."))
+                        GLib.timeout_add(1500, self.close)
+                    self._oauth_popup = _OAuthPopupWindow(
+                        parent=self,
+                        url=url,
+                        on_closed_without_auth=on_popup_closed_without_auth
+                )
+                    self._oauth_popup.present()
+                else:
+                    # No WebKitGTK → CLI opened browser natively, just mark URL seen
+                    self._oauth_popup = True  # prevents re-entry
+                return False
             
         if self.is_ollama:
             import re
@@ -366,6 +579,34 @@ class _ActionProgressWindow(Adw.Window):
     def on_finish(self, rc):
         if self.success:
             return # Forcefully succeeded by auth poller already
+
+        # If popup was cancelled, don't overwrite the "cancelled" message
+        if self.poll_auth_file and isinstance(self._oauth_popup, _OAuthPopupWindow) and not self._oauth_popup.authenticated:
+            return
+
+        # For OAuth flows, the CLI may exit non-zero even though auth succeeded
+        if self.poll_auth_file and rc != 0:
+            auth_file = os.path.expanduser("~/.qwen/oauth_creds.json")
+            try:
+                if os.path.exists(auth_file):
+                    with open(auth_file, 'r') as f:
+                        data = f.read().strip()
+                    if len(data) > 10:
+                        self.status_label.set_label(_("Authentication successful!"))
+                        self.progress.set_fraction(1.0)
+                        self.success = True
+                        GLib.timeout_add(1500, self.close)
+                        return
+            except Exception:
+                pass
+            # Show a user-friendly error for OAuth failures
+            if self._last_error_line:
+                truncated = (self._last_error_line[:80] + '...') if len(self._last_error_line) > 80 else self._last_error_line
+                self.status_label.set_label(truncated)
+            else:
+                self.status_label.set_label(_("Authentication failed. The Qwen OAuth service may be unavailable. Please try again later."))
+            self.success = False
+            return
 
         if rc == 0:
             self.status_label.set_label(_("Operation completed successfully."))
@@ -2416,10 +2657,14 @@ class LinexinAISysadminWidget(Gtk.Box):
         return rc == 0
 
     def on_qwen_install_clicked(self, btn=None, callback=None):
-        cmd = "curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.sh | bash -s -- --source qwenchat"
+        # Run the installer, then verify the binary exists (the script may exit non-zero despite success)
+        verify = 'export PATH="$HOME/.npm-global/bin:$PATH"; command -v qwen >/dev/null 2>&1 || command -v qwen-code >/dev/null 2>&1'
+        cmd = f'curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.sh | bash -s -- --source qwenchat 2>&1; {verify}'
         self.launch_in_app_process(_("Installing Qwen CLI"), cmd, initial_status=_("Preparing installation scripts..."), on_close_callback=callback)
 
     def update_qwen_login_button(self):
+        if not hasattr(self, 'login_btn') or not self.login_btn:
+            return
         auth_file = os.path.expanduser("~/.qwen/oauth_creds.json")
         if os.path.exists(auth_file):
             self.login_btn.set_label(_("Logout of Qwen CLI"))
@@ -2451,10 +2696,12 @@ class LinexinAISysadminWidget(Gtk.Box):
                 self.on_qwen_install_clicked(None, callback=after_install)
                 return
                 
-            cmd = self.get_qwen_env_cmd("qwen \"Authentication ping.\" --auth-type qwen-oauth")
-            self.launch_in_app_process(_("Qwen CLI Login"), cmd, initial_status=_("Waiting for Qwen OAuth URL generation..."), on_close_callback=callback, poll_auth_file=True)
-            # We can't synchronously know when they finish logging in via the stream window,
-            # but they will see it in the stream window. The button will update next time settings are opened.
+            cmd = self.get_qwen_env_cmd("qwen --auth-type qwen-oauth -p ' '")
+            def after_login(success):
+                self.update_qwen_login_button()
+                if callback:
+                    callback(success)
+            self.launch_in_app_process(_("Qwen CLI Login"), cmd, initial_status=_("Waiting for Qwen OAuth URL generation..."), on_close_callback=after_login, poll_auth_file=True)
 
     def on_pull_ollama_clicked(self, model_name, callback=None, combo_row=None):
         if not model_name:
@@ -4098,12 +4345,12 @@ class CompactVoiceWindow(Adw.Window):
                 # Hook into the ready/failed callbacks for cleanup
                 orig_ready = self._ai_widget._on_whisper_model_ready
                 orig_failed = self._ai_widget._on_whisper_model_failed
-                def _wrapped_ready(model_obj, btn_arg):
+                def _wrapped_ready(model_obj, btn):
                     self._hide_status()
-                    return orig_ready(model_obj, btn_arg)
-                def _wrapped_failed(error_msg, btn_arg):
+                    return orig_ready(model_obj, btn)
+                def _wrapped_failed(error_msg, btn):
                     self._show_status(_("Model load failed"))
-                    return orig_failed(error_msg, btn_arg)
+                    return orig_failed(error_msg, btn)
                 self._ai_widget._on_whisper_model_ready = _wrapped_ready
                 self._ai_widget._on_whisper_model_failed = _wrapped_failed
 
@@ -4206,9 +4453,9 @@ class CompactVoiceWindow(Adw.Window):
     # -------------------------------------------------------------------
     # Intercept assistant bubbles to reflect in the status label
     # -------------------------------------------------------------------
-    def _intercepted_add_bubble(self, role, content):
+    def _intercepted_add_bubble(self, role, content, is_html=False):
         """Wrap add_message_bubble to mirror status in compact bar."""
-        self._original_add_bubble(role, content)
+        self._original_add_bubble(role, content, is_html=is_html)
         if role == "assistant":
             text = self._ai_widget._extract_text_from_content(content)
             if text:
@@ -4322,15 +4569,15 @@ if __name__ == "__main__":
     _voice = "--voice" in _sys.argv
 
     class TestApp(Gtk.Application):
-        def do_activate(self_app):
+        def do_activate(self):
             if _compact:
                 win = CompactVoiceWindow(
-                    application=self_app,
+                    application=self,
                     voice_autostart=_voice,
                 )
                 win.present()
             else:
-                win = Gtk.ApplicationWindow(application=self_app)
+                win = Gtk.ApplicationWindow(application=self)
                 win.set_title("AI Sysadmin Widget")
                 win.set_default_size(800, 600)
                 widget = LinexinAISysadminWidget(hide_sidebar=True, window=win)
