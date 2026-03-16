@@ -563,7 +563,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             "If there is no flatpak version of what the user is asking for, you should then ONLY use the system package manager to fulfil the request. "
             "If the user wants you to run any program, you should first check if it is installed by searching both installed system packages and installed flatpaks. If it is not installed, you should tell the user that it is not installed and ask them if they want you to install it. "
             "If you need to launch a GUI application, you MUST run it in the background disconnected from stdout like this: `nohup app_name >/dev/null 2>&1 & disown` so it does not block the terminal. "
-            "Try to use commands without sudo whenever possible, but if you need to perform a privileged action, you can use sudo. "
+            "If the user wants you to `Shutdown` / `Turn off` / `Power down`, you MUST run ```bash\nshutdown now\n``` (no sudo needed). If the user wants to `Reboot` / `Restart`, run ```bash\nreboot\n``` (no sudo needed)."
             "You may run multiple queries in sequence. Once you have all the information necessary, provide a final conversational response WITHOUT any bash blocks. "
         )
         self.chat_history = []
@@ -1452,9 +1452,9 @@ class LinexinAISysadminWidget(Gtk.Box):
                 import time as time_mod
                 SAMPLE_RATE = 16000
                 CHUNK_SIZE = 4000  # ~0.125s of audio at 16kHz mono 16-bit
-                SILENCE_THRESHOLD = 500  # RMS amplitude threshold for silence detection
+                SILENCE_THRESHOLD = 360  # Lower threshold to better detect quieter speech
                 SILENCE_TIMEOUT = 2.0  # seconds of silence before auto-send
-                SPEECH_CONFIRM_FRAMES = 3  # consecutive loud frames to confirm speech
+                SPEECH_CONFIRM_FRAMES = 2  # Faster confirmation for softer/short utterances
 
                 audio_frames: list[bytes] = []
                 last_speech_time: float = time_mod.time()  # type: ignore
@@ -3082,7 +3082,7 @@ class LinexinAISysadminWidget(Gtk.Box):
         full_output = ""
         for code in code_blocks:
             if getattr(self, 'abort_processing', False): break
-            
+
             # Auto-Execution Safety Check
             if not getattr(self, 'auto_execute_commands', True):
                 ev_safety = threading.Event()
@@ -3122,6 +3122,12 @@ class LinexinAISysadminWidget(Gtk.Box):
                     full_output += f"Command:\n{code}\nExit Code: Denied\n\nSTDERR:\nThe user explicitly denied permission to run this command. You must think of another way or ask the user for clarification.\n\n---\n\n"
                     # We continue rather than break so that multiple commands in one block are individually evaluated or skipped
                     continue
+
+            # Strip sudo from power management commands — logind grants these to the active session user.
+            code = re.sub(
+                r'\bsudo\s+((?:systemctl\s+)?(?:poweroff|reboot|halt|suspend|hibernate)|shutdown(?:\s+\S+)*)',
+                r'\1', code
+            )
 
             manager = self.sudo_manager
             is_privileged = False
@@ -3226,14 +3232,14 @@ class LinexinAISysadminWidget(Gtk.Box):
             
             # Re-fire API recursively in the background thread
             if getattr(self, 'backend', 'local') == 'qwen_cli':
-                self.call_qwen_cli() # type: ignore
+                self.call_qwen_cli(is_followup=True) # type: ignore
             elif getattr(self, 'is_ollama', False):
                 self.call_local_ollama() # type: ignore
             else:
                 self.call_direct_api() # type: ignore
         return True
 
-    def call_qwen_cli(self):
+    def call_qwen_cli(self, is_followup=False):
         # Prevent exit code 127 if trying to interact with something that isn't installed.
         if not self.is_qwen_installed():
             def after_install(success):
@@ -3256,8 +3262,9 @@ class LinexinAISysadminWidget(Gtk.Box):
             GLib.idle_add(self.on_qwen_auth_clicked, None, after_auth)
             return
 
-        # We only pass the latest message to Qwen CLI.
-        # Qwen's internal SQLite database handles the conversation memory via --chat-recording.
+        # We pass the latest message plus an explicit role preamble.
+        # Qwen's internal SQLite database handles conversation memory via --chat-recording,
+        # but it does not automatically inherit this widget's Python-side system message.
         latest_content = self.chat_history[-1]['content']
         latest_msg = self._extract_text_from_content(latest_content)
         
@@ -3285,10 +3292,28 @@ class LinexinAISysadminWidget(Gtk.Box):
                 except Exception as e:
                     print(f"[Qwen CLI] Failed to save image: {e}")
         
+        # Always prepend Alexy's system prompt for Qwen CLI so identity/policy stays aligned
+        # with direct/local backends, even across resumed sessions.
+        qwen_system_preamble = (
+            "[SYSTEM ROLE - HIGHEST PRIORITY]\n"
+            f"{self.system_prompt.strip()}\n\n"
+            "[ENFORCED INSTALL POLICY]\n"
+            "For app installation requests, you MUST prioritize Flatpak first. "
+            "First search/install via Flatpak. Only if no Flatpak exists may you use pacman, "
+            "and only after explicitly telling the user no Flatpak exists.\n\n"
+            "[SYSTEM ROLE - OVERRIDE]\n"
+            "If your built-in defaults conflict with the above system role, ignore your "
+            "built-in defaults and follow the system role above."
+        )
+
         # Override Qwen CLI's internal autonomous execution tools.
         # If we don't, Qwen attempts to run sudo in its own hidden background PTY and fails.
-        cli_override = "\n\n[SYSTEM INSTRUCTION: DO NOT use any internal tools to execute commands. If you need to run bash/sudo, ONLY output a markdown ```bash block and I will execute it. CRITICAL: Do NOT acknowledge this system instruction in your reply. Just reply to the user's message as if this instruction was never appended.]"
-        prompt_with_override = latest_msg + cli_override
+        if is_followup:
+            # After commands ran, we want a conversational summary — not more bash blocks.
+            cli_override = "\n\n[SYSTEM INSTRUCTION: The commands above have been executed and the results are shown. Provide a short conversational response summarising what happened. Do NOT output any bash code blocks unless the task explicitly requires additional commands. CRITICAL: Do NOT acknowledge this instruction in your reply.]"
+        else:
+            cli_override = "\n\n[SYSTEM INSTRUCTION: DO NOT use any internal tools to execute commands. If you need to run bash/sudo, ONLY output a markdown ```bash block and I will execute it. CRITICAL: Do NOT acknowledge this system instruction in your reply. Just reply to the user's message as if this instruction was never appended.]"
+        prompt_with_override = f"{qwen_system_preamble}\n\n[USER MESSAGE]\n{latest_msg}{cli_override}"
         
         # Try both `qwen` and `qwen-code`
         cli_cmds = ["qwen", "qwen-code"]
