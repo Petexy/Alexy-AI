@@ -862,7 +862,8 @@ class LinexinAISysadminWidget(Gtk.Box):
         """Extract the first user message as a conversation title."""
         for msg in chat_history:
             if msg["role"] == "user":
-                text = self._extract_text_from_content(msg["content"])
+                stripped = self._strip_system_instructions(msg["content"])
+                text = self._extract_text_from_content(stripped)
                 title = text.strip().replace("\n", " ")
                 if not title:
                     title = _("Image")
@@ -933,7 +934,7 @@ class LinexinAISysadminWidget(Gtk.Box):
                 text = self._extract_text_from_content(msg["content"])
                 if text.startswith("System Command Execution Results:"):
                     continue
-                self.add_message_bubble("user", msg["content"])
+                self.add_message_bubble("user", self._strip_system_instructions(msg["content"]))
             elif msg["role"] == "assistant":
                 # Skip assistant replies that are purely bash code blocks (autonomous commands)
                 stripped = msg["content"].strip()
@@ -3242,6 +3243,25 @@ class LinexinAISysadminWidget(Gtk.Box):
             return " ".join(item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text")
         return str(content)
 
+    _SCREEN_AWARENESS_PREFIX = "[A screenshot of my current screen is attached for context. Only reference or describe it if my question is related to what is on screen. If my question is unrelated to the screen content, ignore the screenshot entirely and just answer my question.]\n\n"
+
+    def _strip_system_instructions(self, content):
+        """Return a display-safe copy of content with the screen-awareness LLM preamble removed."""
+        prefix = self._SCREEN_AWARENESS_PREFIX
+        if isinstance(content, list):
+            stripped = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text" and item["text"].startswith(prefix):
+                    clean_text = item["text"][len(prefix):]
+                    if clean_text:
+                        stripped.append({"type": "text", "text": clean_text})
+                else:
+                    stripped.append(item)
+            return stripped
+        if isinstance(content, str) and content.startswith(prefix):
+            return content[len(prefix):]
+        return content
+
     def _extract_images_from_content(self, content):
         """Extract image data URLs from a multimodal content list."""
         if not isinstance(content, list):
@@ -3327,7 +3347,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             if text:
                 if has_screen_capture:
                     # Instruct the LLM to only use the screenshot as context when relevant
-                    content.append({"type": "text", "text": f"[A screenshot of my current screen is attached for context. Only reference or describe it if my question is related to what is on screen. If my question is unrelated to the screen content, ignore the screenshot entirely and just answer my question.]\n\n{text}"})
+                    content.append({"type": "text", "text": f"{self._SCREEN_AWARENESS_PREFIX}{text}"})
                 else:
                     content.append({"type": "text", "text": text})
                 display_content.append({"type": "text", "text": text})
