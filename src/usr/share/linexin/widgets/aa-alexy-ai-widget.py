@@ -3101,53 +3101,26 @@ class LinexinAISysadminWidget(Gtk.Box):
         return False
 
     def _process_screenshot(self, screenshot_path):
-        """Downscale and encode a screenshot file. Returns (mime_type, base64_data) or None."""
+        """Encode a screenshot file as base64. Returns (mime_type, base64_data) or None."""
         try:
-            gi.require_version("GdkPixbuf", "2.0")
-            from gi.repository import GdkPixbuf  # type: ignore
-            pixbuf = GdkPixbuf.Pixbuf.new_from_file(screenshot_path)
-            width = pixbuf.get_width()
-            height = pixbuf.get_height()
-            MAX_DIM = 1280
-            if width > MAX_DIM or height > MAX_DIM:
-                scale = MAX_DIM / max(width, height)
-                new_w = int(width * scale)
-                new_h = int(height * scale)
-                pixbuf = pixbuf.scale_simple(new_w, new_h, GdkPixbuf.InterpType.BILINEAR)
-            resized_path = screenshot_path.replace(".png", ".jpg")
-            pixbuf.savev(resized_path, "jpeg", ["quality"], ["90"])
-
-            with open(resized_path, "rb") as f:
+            with open(screenshot_path, "rb") as f:
                 raw = f.read()
             b64 = base64.b64encode(raw).decode("ascii")
-            return ("image/jpeg", b64)
+            return ("image/png", b64)
         except Exception as e:
-            print(f"[Screen Awareness] Resize failed, using original: {e}")
-            try:
-                with open(screenshot_path, "rb") as f:
-                    raw = f.read()
-                b64 = base64.b64encode(raw).decode("ascii")
-                return ("image/png", b64)
-            except Exception as e2:
-                print(f"[Screen Awareness] Failed to read screenshot: {e2}")
-                return None
-        finally:
-            for p in [screenshot_path, screenshot_path.replace(".png", ".jpg")]:
-                try:
-                    os.unlink(p)
-                except Exception:
-                    pass
+            print(f"[Screen Awareness] Failed to read screenshot: {e}")
+            return None
 
     def _cleanup_screenshot_tmp(self):
-        """Remove the /tmp/linexin screenshot directory and all its contents."""
-        screenshot_dir = "/tmp/linexin"
-        if os.path.isdir(screenshot_dir):
-            try:
-                import shutil
-                shutil.rmtree(screenshot_dir)
-                print("[Screen Awareness] Cleaned up screenshot temp directory")
-            except Exception as e:
-                print(f"[Screen Awareness] Failed to clean up {screenshot_dir}: {e}")
+        """Remove the /tmp/linexin and ~/.qwen/tmp screenshot directories and all their contents."""
+        import shutil
+        for screenshot_dir in ["/tmp/linexin", os.path.expanduser("~/.qwen/tmp")]:
+            if os.path.isdir(screenshot_dir):
+                try:
+                    shutil.rmtree(screenshot_dir)
+                    print(f"[Screen Awareness] Cleaned up {screenshot_dir}")
+                except Exception as e:
+                    print(f"[Screen Awareness] Failed to clean up {screenshot_dir}: {e}")
 
     def _on_clipboard_texture_ready(self, clipboard, result):
         """Callback for async clipboard texture read."""
@@ -3350,18 +3323,22 @@ class LinexinAISysadminWidget(Gtk.Box):
         if images:
             # Build multimodal content (OpenAI vision format)
             content = []
+            display_content = []
             if text:
                 if has_screen_capture:
                     # Instruct the LLM to only use the screenshot as context when relevant
                     content.append({"type": "text", "text": f"[A screenshot of my current screen is attached for context. Only reference or describe it if my question is related to what is on screen. If my question is unrelated to the screen content, ignore the screenshot entirely and just answer my question.]\n\n{text}"})
                 else:
                     content.append({"type": "text", "text": text})
+                display_content.append({"type": "text", "text": text})
             for mime_type, b64_data in images:
-                content.append({
+                image_item = {
                     "type": "image_url",
                     "image_url": {"url": f"data:{mime_type};base64,{b64_data}"}
-                })
-            self.add_message_bubble("user", content)
+                }
+                content.append(image_item)
+                display_content.append(image_item)
+            self.add_message_bubble("user", display_content)
             self.chat_history.append({"role": "user", "content": content})
         else:
             self.add_message_bubble("user", text)
@@ -3888,6 +3865,7 @@ class LinexinAISysadminWidget(Gtk.Box):
     def on_api_success(self, reply):
         if getattr(self, 'abort_processing', False): return
         self._remove_thinking_indicator()
+        self._cleanup_screenshot_tmp()
 
         def _unlock_input():
             self.llm_processing = False
@@ -4040,6 +4018,7 @@ class LinexinAISysadminWidget(Gtk.Box):
     def on_api_error(self, error_msg):
         if getattr(self, 'abort_processing', False): return
         self._remove_thinking_indicator()
+        self._cleanup_screenshot_tmp()
         self.llm_processing = False
         self.add_message_bubble("assistant", _("⚠️ Error: ") + error_msg)
         if len(self.chat_history) > 1:
