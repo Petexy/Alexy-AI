@@ -844,6 +844,9 @@ class LinexinAISysadminWidget(Gtk.Box):
             "If you need to launch a GUI application, you MUST run it in the background disconnected from stdout like this: `nohup app_name >/dev/null 2>&1 & disown` so it does not block the terminal. "
             "If the user wants you to `Shutdown` / `Turn off` / `Power down`, you MUST run ```bash\nshutdown now\n``` (no sudo needed). If the user wants to `Reboot` / `Restart`, run ```bash\nreboot\n``` (no sudo needed)."
             "You may run multiple queries in sequence. Once you have all the information necessary, provide a final conversational response WITHOUT any bash blocks. "
+            "CRITICAL: You MUST always reply in the same language the user is writing or speaking to you in. "
+            "If the user writes in Polish, reply in Polish. If they write in German, reply in German, etc. "
+            "Never switch to English or any other language just because the screen content, terminal output, or other context is in that language — always match the user's language."
         )
         self.chat_history = []
         self.current_conversation_id = str(uuid.uuid4())
@@ -2276,6 +2279,90 @@ class LinexinAISysadminWidget(Gtk.Box):
         remove_row.set_activatable_widget(remove_btn)
         local_group.add(remove_row)
 
+        # Ollama install / uninstall management row
+        ollama_installed = self.is_ollama_installed()
+        ollama_manage_row = Adw.ActionRow()
+        if ollama_installed:
+            ollama_manage_row.set_title(_("Ollama is installed"))
+            ollama_manage_row.set_subtitle(_("Remove the Ollama daemon and its dependencies from your system."))
+            ollama_manage_btn = Gtk.Button(label=_("Uninstall Ollama"), valign=Gtk.Align.CENTER)
+            ollama_manage_btn.add_css_class("destructive-action")
+            def on_ollama_uninstall_clicked(btn):
+                def do_uninstall():
+                    cmd = "pacman -Rns ollama --noconfirm"
+                    win_uninstall = _ActionProgressWindow(
+                        parent=window,
+                        title=_("Uninstalling Ollama"),
+                        cmd_string=cmd,
+                        poll_auth_file=False,
+                        sudo_manager=self.sudo_manager
+                    )
+                    def on_uninstall_done(success):
+                        if success:
+                            ollama_manage_row.set_title(_("Ollama has been uninstalled"))
+                            ollama_manage_row.set_subtitle(_("Install the Ollama daemon to use Local AI."))
+                            ollama_manage_btn.set_label(_("Install Ollama"))
+                            ollama_manage_btn.remove_css_class("destructive-action")
+                            ollama_manage_btn.add_css_class("suggested-action")
+                            ollama_manage_btn.disconnect_by_func(on_ollama_uninstall_clicked)
+                            ollama_manage_btn.connect("clicked", on_ollama_install_settings_clicked)
+                            self._refresh_ollama_models(local_model_row)
+                    win_uninstall.on_close_callback = on_uninstall_done
+                    win_uninstall.present()
+                manager = self.sudo_manager
+                if not manager or not manager.user_password:
+                    self._prompt_for_password_dialog(
+                        do_uninstall,
+                        _("Please enter your password to uninstall Ollama.")
+                    )
+                else:
+                    do_uninstall()
+            ollama_manage_btn.connect("clicked", on_ollama_uninstall_clicked)
+        else:
+            ollama_manage_row.set_title(_("Ollama is not installed"))
+            ollama_manage_row.set_subtitle(_("Install the Ollama daemon to use Local AI."))
+            ollama_manage_btn = Gtk.Button(label=_("Install Ollama"), valign=Gtk.Align.CENTER)
+            ollama_manage_btn.add_css_class("suggested-action")
+
+        def on_ollama_install_settings_clicked(btn):
+            def do_install():
+                cmd = "curl -fsSL https://ollama.com/install.sh | sh"
+                win_install = _ActionProgressWindow(
+                    parent=window,
+                    title=_("Installing Ollama"),
+                    cmd_string=cmd,
+                    poll_auth_file=False,
+                    sudo_manager=self.sudo_manager,
+                    initial_status=_("Downloading and installing Ollama daemon...")
+                )
+                def on_install_done(success):
+                    if success:
+                        ollama_manage_row.set_title(_("Ollama is installed"))
+                        ollama_manage_row.set_subtitle(_("Remove the Ollama daemon and its dependencies from your system."))
+                        ollama_manage_btn.set_label(_("Uninstall Ollama"))
+                        ollama_manage_btn.remove_css_class("suggested-action")
+                        ollama_manage_btn.add_css_class("destructive-action")
+                        ollama_manage_btn.disconnect_by_func(on_ollama_install_settings_clicked)
+                        ollama_manage_btn.connect("clicked", on_ollama_uninstall_clicked)
+                        self._refresh_ollama_models(local_model_row)
+                win_install.on_close_callback = on_install_done
+                win_install.present()
+            manager = self.sudo_manager
+            if not manager or not manager.user_password:
+                self._prompt_for_password_dialog(
+                    do_install,
+                    _("Please enter your password to install Ollama via system privileges.")
+                )
+            else:
+                do_install()
+
+        if not ollama_installed:
+            ollama_manage_btn.connect("clicked", on_ollama_install_settings_clicked)
+
+        ollama_manage_row.add_suffix(ollama_manage_btn)
+        ollama_manage_row.set_activatable_widget(ollama_manage_btn)
+        local_group.add(ollama_manage_row)
+
         pull_group = Adw.PreferencesGroup(title=_("Download Model"))
         page_llm.add(pull_group)
 
@@ -3283,7 +3370,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             return " ".join(item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text")
         return str(content)
 
-    _SCREEN_AWARENESS_PREFIX = "[A screenshot of my current screen is attached for context. Only reference or describe it if my question is related to what is on screen. If my question is unrelated to the screen content, ignore the screenshot entirely and just answer my question.]\n\n"
+    _SCREEN_AWARENESS_PREFIX = "[A screenshot of my current screen is attached. IMPORTANT: If my question is NOT about the screen content, do NOT describe, mention, reference, or acknowledge the screenshot in any way — just answer my question directly as if no screenshot was provided. Only use the screenshot if my question is specifically about what is on screen.]\n\n"
 
     def _strip_system_instructions(self, content):
         """Return a display-safe copy of content with the screen-awareness LLM preamble removed."""
@@ -3859,11 +3946,19 @@ class LinexinAISysadminWidget(Gtk.Box):
         # to actually view the image contents.
         if image_paths:
             paths_list = "\n".join(image_paths)
-            image_hint = (
-                f"\n\n[IMAGE ATTACHED — you MUST read and analyze the following image file(s) using your tools before responding:\n{paths_list}\n"
-                "Describe ONLY what is actually visible in the image. Read all text exactly as shown — "
-                "do NOT translate, assume, or hallucinate any content.]"
-            )
+            is_screen_aware = latest_msg.startswith(self._SCREEN_AWARENESS_PREFIX)
+            if is_screen_aware:
+                image_hint = (
+                    f"\n\n[IMAGE ATTACHED — read the following image file(s) using your tools:\n{paths_list}\n"
+                    "This is a screenshot of the user's screen provided for context. "
+                    "IMPORTANT: If the user's question is NOT about the screen content, do NOT describe, mention, "
+                    "reference, or acknowledge the screenshot in any way — just answer the question directly "
+                    "as if no screenshot was provided. Only use the screenshot if the question is specifically about what is on screen.]")
+            else:
+                image_hint = (
+                    f"\n\n[IMAGE ATTACHED — you MUST read and analyze the following image file(s) using your tools before responding:\n{paths_list}\n"
+                    "Describe ONLY what is actually visible in the image. Read all text exactly as shown — "
+                    "do NOT translate, assume, or hallucinate any content.]")
             # Use a relaxed tool override when images are present so the model
             # can use its file-reading tool to view the image.
             if is_followup:
