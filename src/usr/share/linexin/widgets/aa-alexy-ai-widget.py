@@ -334,8 +334,10 @@ class _ActionProgressWindow(Adw.Window):
         self.success = False
         self.process_finished = False
         self.poll_auth_file = poll_auth_file
-        self.process: Optional[subprocess.Popen[str]] = None
+        self.process: Optional[subprocess.Popen[bytes]] = None
         self.sudo_manager = sudo_manager
+        self._has_real_progress = False
+        self.set_deletable(False)
         self.connect("close-request", self.handle_close)
         self._oauth_popup = None
         self._last_error_line = None
@@ -389,7 +391,7 @@ class _ActionProgressWindow(Adw.Window):
             GLib.timeout_add(100, self.check_auth_file)
 
     def pulse_progress(self):
-        if not self.process_finished and not self.is_ollama:
+        if not self.process_finished and not self.is_ollama and not self._has_real_progress:
             self.progress.pulse()
             return True
         return False
@@ -425,9 +427,6 @@ class _ActionProgressWindow(Adw.Window):
                 cmd_args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
                 env=env
             )
             
@@ -435,8 +434,19 @@ class _ActionProgressWindow(Adw.Window):
             if process:
                 stdout = process.stdout
                 if stdout:
-                    for line in stdout:
-                        GLib.idle_add(self.parse_and_append, line)
+                    buf = b""
+                    while True:
+                        chunk = stdout.read(1)
+                        if not chunk:
+                            if buf:
+                                GLib.idle_add(self.parse_and_append, buf.decode("utf-8", errors="replace"))
+                            break
+                        if chunk in (b"\n", b"\r"):
+                            if buf:
+                                GLib.idle_add(self.parse_and_append, buf.decode("utf-8", errors="replace"))
+                                buf = b""
+                        else:
+                            buf += chunk
                 
             if process:
                 process.wait()
@@ -468,7 +478,7 @@ class _ActionProgressWindow(Adw.Window):
 
     def parse_and_append(self, line):
         # Print raw output to the shell for debugging
-        print(line, end="")
+        print(line)
         
         import re
         
@@ -485,6 +495,14 @@ class _ActionProgressWindow(Adw.Window):
         
         # Filter out progress bar lines (curl ##, npm progress, spinners)
         if re.match(r'^[#\s.]+$', filtered_line):
+            return False
+        # Detect curl-style progress bars with percentage (e.g. "######### 45.2%")
+        curl_pct_match = re.match(r'^[#\s]+(\d+(?:\.\d+)?)%\s*$', filtered_line)
+        if curl_pct_match:
+            pct = float(curl_pct_match.group(1))
+            self._has_real_progress = True
+            self.progress.set_fraction(pct / 100.0)
+            self.status_label.set_label(f"{pct:.1f}%")
             return False
         if re.match(r'^[\\|/\-⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏\s]+$', filtered_line):
             return False
@@ -512,6 +530,7 @@ class _ActionProgressWindow(Adw.Window):
                         if process:
                             process.terminate()
                         self.status_label.set_label(_("Authorization was cancelled."))
+                        self.set_deletable(True)
                         GLib.timeout_add(1500, self.close)
                     self._oauth_popup = _OAuthPopupWindow(
                         parent=self,
@@ -546,6 +565,12 @@ class _ActionProgressWindow(Adw.Window):
                 val = int(match.group(1))
                 self.progress.set_fraction(val / 100.0)
         else:
+            # Extract percentage if present and update progress bar
+            match = re.search(r'(\d+(?:\.\d+)?)%', clean_line)
+            if match:
+                self._has_real_progress = True
+                val = float(match.group(1))
+                self.progress.set_fraction(val / 100.0)
             # Just take the last 60 chars of whatever it is doing to look busy
             truncated = (filtered_line[:60] + '...') if len(filtered_line) > 60 else filtered_line # type: ignore
             self.status_label.set_label(truncated)
@@ -570,6 +595,7 @@ class _ActionProgressWindow(Adw.Window):
                         process = self.process
                         if process:
                             process.terminate()
+                        self.set_deletable(True)
                         GLib.timeout_add(1500, self.close)
                         return False
             except Exception:
@@ -582,6 +608,7 @@ class _ActionProgressWindow(Adw.Window):
 
         # If popup was cancelled, don't overwrite the "cancelled" message
         if self.poll_auth_file and isinstance(self._oauth_popup, _OAuthPopupWindow) and not self._oauth_popup.authenticated:
+            self.set_deletable(True)
             return
 
         # For OAuth flows, the CLI may exit non-zero even though auth succeeded
@@ -595,6 +622,7 @@ class _ActionProgressWindow(Adw.Window):
                         self.status_label.set_label(_("Authentication successful!"))
                         self.progress.set_fraction(1.0)
                         self.success = True
+                        self.set_deletable(True)
                         GLib.timeout_add(1500, self.close)
                         return
             except Exception:
@@ -605,6 +633,7 @@ class _ActionProgressWindow(Adw.Window):
                 self.status_label.set_label(truncated)
             else:
                 self.status_label.set_label(_("Authentication failed. The Qwen OAuth service may be unavailable. Please try again later."))
+            self.set_deletable(True)
             self.success = False
             return
 
@@ -612,12 +641,16 @@ class _ActionProgressWindow(Adw.Window):
             self.status_label.set_label(_("Operation completed successfully."))
             self.progress.set_fraction(1.0)
             self.success = True
+            self.set_deletable(True)
             GLib.timeout_add(1500, self.close)
         else:
+            self.set_deletable(True)
             self.status_label.set_label(_(f"Operation failed with exit code {rc}. Check console output."))
             self.success = False
 
     def handle_close(self, win):
+        if not self.process_finished:
+            return True
         if hasattr(self, 'on_close_callback') and self.on_close_callback:
             self.on_close_callback(self.success)
         return False
@@ -1388,11 +1421,11 @@ class LinexinAISysadminWidget(Gtk.Box):
         header_box.append(self.conv_toggle_btn)
 
         # Settings button
-        settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
-        settings_btn.set_valign(Gtk.Align.CENTER)
-        settings_btn.add_css_class("circular")
-        settings_btn.connect("clicked", self.on_settings_clicked)
-        header_box.append(settings_btn)
+        self.settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
+        self.settings_btn.set_valign(Gtk.Align.CENTER)
+        self.settings_btn.add_css_class("circular")
+        self.settings_btn.connect("clicked", self.on_settings_clicked)
+        header_box.append(self.settings_btn)
 
         self.append(header_box)
 
@@ -2659,7 +2692,8 @@ class LinexinAISysadminWidget(Gtk.Box):
 
     def on_qwen_install_clicked(self, btn=None, callback=None):
         # Run the installer, then verify the binary exists (the script may exit non-zero despite success)
-        verify = 'export PATH="$HOME/.npm-global/bin:$PATH"; command -v qwen >/dev/null 2>&1 || command -v qwen-code >/dev/null 2>&1'
+        # Use get_qwen_env_cmd so nvm is sourced — the binary may only be findable through nvm's PATH.
+        verify = self.get_qwen_env_cmd("command -v qwen >/dev/null 2>&1 || command -v qwen-code >/dev/null 2>&1")
         cmd = f'curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.sh | bash -s -- --source qwenchat 2>&1; {verify}'
         self.launch_in_app_process(_("Installing Qwen CLI"), cmd, initial_status=_("Preparing installation scripts..."), on_close_callback=callback)
 
@@ -2875,6 +2909,9 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.entry.set_sensitive(True)
         self.send_btn.set_icon_name("mail-send-symbolic")
         self.stt_toggle.set_sensitive(True)
+        self.new_conv_btn.set_sensitive(True)
+        self.conv_toggle_btn.set_sensitive(True)
+        self.settings_btn.set_sensitive(True)
         if hasattr(self, 'qwen_proc') and self.qwen_proc:
             try:
                 self.qwen_proc.terminate()
@@ -2895,6 +2932,9 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.tts_playing = False
         self.send_btn.set_icon_name("mail-send-symbolic")
         self.stt_toggle.set_sensitive(True)
+        self.new_conv_btn.set_sensitive(True)
+        self.conv_toggle_btn.set_sensitive(True)
+        self.settings_btn.set_sensitive(True)
         self.entry.set_sensitive(True)
         self.entry.grab_focus()
 
@@ -3316,6 +3356,9 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.entry.set_sensitive(False)
         self.send_btn.set_icon_name("media-playback-stop-symbolic")
         self.stt_toggle.set_sensitive(False)
+        self.new_conv_btn.set_sensitive(False)
+        self.conv_toggle_btn.set_sensitive(False)
+        self.settings_btn.set_sensitive(False)
         self.llm_processing = True
         self.abort_processing = False
         self.spinner.set_visible(True)
@@ -3469,7 +3512,11 @@ class LinexinAISysadminWidget(Gtk.Box):
         if not self.is_ollama_installed():
             def after_install(success):
                 if success:
-                    # After install completes, user probably still doesn't have a model pulled
+                    # Start the Ollama service after installation
+                    try:
+                        subprocess.run(["systemctl", "enable", "--now", "ollama"], capture_output=True, timeout=15)
+                    except Exception:
+                        pass
                     if not self.local_model:
                         GLib.idle_add(self.on_api_error, _("Ollama Installed! Please open Settings to pull an AI model."))
                     else:
@@ -3544,9 +3591,10 @@ class LinexinAISysadminWidget(Gtk.Box):
                 def after_pull(success):
                     if success:
                         GLib.idle_add(lambda: threading.Thread(target=self.call_local_ollama).start())
-                        
-                msg = f"Model '{self.local_model}' not found in Ollama locally. Initiating automatic download..."
-                GLib.idle_add(self.on_api_error, msg)
+                    else:
+                        GLib.idle_add(self.on_api_error, _("Model download was cancelled or failed."))
+
+                GLib.idle_add(self.add_message_bubble, "assistant", _("Model '{}' not found locally. Downloading now...").format(self.local_model))
                 GLib.idle_add(lambda: self.on_pull_ollama_clicked(self.local_model, after_pull))
                 return
                 
@@ -3892,6 +3940,9 @@ class LinexinAISysadminWidget(Gtk.Box):
             self.entry.set_sensitive(True)
             self.send_btn.set_icon_name("mail-send-symbolic")
             self.stt_toggle.set_sensitive(True)
+            self.new_conv_btn.set_sensitive(True)
+            self.conv_toggle_btn.set_sensitive(True)
+            self.settings_btn.set_sensitive(True)
             self.spinner.stop()
             self.spinner.set_visible(False)
             self.entry.grab_focus()
@@ -4046,6 +4097,9 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.entry.set_sensitive(True)
         self.send_btn.set_icon_name("mail-send-symbolic")
         self.stt_toggle.set_sensitive(True)
+        self.new_conv_btn.set_sensitive(True)
+        self.conv_toggle_btn.set_sensitive(True)
+        self.settings_btn.set_sensitive(True)
         self.spinner.stop()
         self.spinner.set_visible(False)
         self.entry.grab_focus()

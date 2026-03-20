@@ -18,6 +18,8 @@ translations = {
     'Cancel': 'Cancelar',
     'Chinese': 'Chinês',
     'Command Execution Request': 'Solicitação de execução de comando',
+    'Compact Mode Screen Awareness': 'Reconhecimento de tela no modo compacto',
+    'Automatically capture and send a screenshot to the AI when using compact voice mode (Hey Alexy).': 'Capturar e enviar automaticamente uma captura de tela para a IA ao usar o modo de voz compacto (Hey Alexy).',
     'Configure how Alexy connects to models.': 'Configure como o Alexy se conecta aos modelos.',
     "Continuously listens for 'Hey Alexy' to activate the assistant. Uses openWakeWord for lightweight wake word detection.": "Ouve continuamente 'Hey Alexy' para ativar o assistente. Usa openWakeWord para detecção leve de palavra de ativação.",
     'Custom themes can be installed to:\n{}': 'Temas personalizados podem ser instalados em:\n{}',
