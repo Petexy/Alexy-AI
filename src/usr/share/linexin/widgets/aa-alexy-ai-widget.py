@@ -844,9 +844,10 @@ class LinexinAISysadminWidget(Gtk.Box):
             "If you need to launch a GUI application, you MUST run it in the background disconnected from stdout like this: `nohup app_name >/dev/null 2>&1 & disown` so it does not block the terminal. "
             "If the user wants you to `Shutdown` / `Turn off` / `Power down`, you MUST run ```bash\nshutdown now\n``` (no sudo needed). If the user wants to `Reboot` / `Restart`, run ```bash\nreboot\n``` (no sudo needed)."
             "You may run multiple queries in sequence. Once you have all the information necessary, provide a final conversational response WITHOUT any bash blocks. "
-            "CRITICAL: You MUST always reply in the same language the user is writing or speaking to you in. "
+            "CRITICAL LANGUAGE RULE: You MUST always reply in the same language the user is writing or speaking to you in — determine this ONLY from the user's text messages, NEVER from screenshots, images, screen content, terminal output, or any other visual context. "
+            "If the user writes in English, reply in English even if a screenshot shows Polish, German, or any other language. "
             "If the user writes in Polish, reply in Polish. If they write in German, reply in German, etc. "
-            "Never switch to English or any other language just because the screen content, terminal output, or other context is in that language — always match the user's language."
+            "The language of attached images or screen content is completely irrelevant to your reply language — always match the user's text language."
         )
         self.chat_history = []
         self.current_conversation_id = str(uuid.uuid4())
@@ -3193,7 +3194,16 @@ class LinexinAISysadminWidget(Gtk.Box):
         try:
             import shutil
             shutil.copy2(src_path, dest_path)
-            return os.path.isfile(dest_path)
+            if not os.path.isfile(dest_path):
+                return False
+            # Remove the portal's original file (usually in ~/Pictures)
+            # so it does not accumulate after each Screen Awareness query.
+            try:
+                os.remove(src_path)
+                print(f"[Screen Awareness] Removed portal source file {src_path}")
+            except Exception as e_rm:
+                print(f"[Screen Awareness] Could not remove portal source file: {e_rm}")
+            return True
         except Exception as e:
             print(f"[Screen Awareness] Failed to copy portal screenshot: {e}")
             return False
@@ -3370,7 +3380,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             return " ".join(item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text")
         return str(content)
 
-    _SCREEN_AWARENESS_PREFIX = "[A screenshot of my current screen is attached. IMPORTANT: If my question is NOT about the screen content, do NOT describe, mention, reference, or acknowledge the screenshot in any way — just answer my question directly as if no screenshot was provided. Only use the screenshot if my question is specifically about what is on screen.]\n\n"
+    _SCREEN_AWARENESS_PREFIX = "[A screenshot of my current screen is attached. IMPORTANT: If my question is NOT about the screen content, do NOT describe, mention, reference, or acknowledge the screenshot in any way — just answer my question directly as if no screenshot was provided. Only use the screenshot if my question is specifically about what is on screen. LANGUAGE RULE: The language visible in the screenshot must NEVER influence your reply language. Always reply in the language of my text message, regardless of what language appears on screen.]\n\n"
 
     def _strip_system_instructions(self, content):
         """Return a display-safe copy of content with the screen-awareness LLM preamble removed."""
@@ -3854,9 +3864,9 @@ class LinexinAISysadminWidget(Gtk.Box):
             self.chat_history.append({"role": "user", "content": sys_msg}) # type: ignore
             
             # Re-fire API recursively in the background thread
-            if getattr(self, 'backend', 'local') == 'qwen_cli':
+            if self.backend == 'qwen_cli':
                 self.call_qwen_cli(is_followup=True) # type: ignore
-            elif getattr(self, 'is_ollama', False):
+            elif self.backend == 'local':
                 self.call_local_ollama() # type: ignore
             else:
                 self.call_direct_api() # type: ignore
