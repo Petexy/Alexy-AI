@@ -2290,7 +2290,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             ollama_manage_btn.add_css_class("destructive-action")
             def on_ollama_uninstall_clicked(btn):
                 def do_uninstall():
-                    cmd = "pacman -Rns ollama --noconfirm"
+                    cmd = "pacman -Qi ollama &>/dev/null && pacman -Rns ollama --noconfirm || { systemctl disable --now ollama 2>/dev/null; rm -f /usr/local/bin/ollama; rm -rf /usr/local/lib/ollama; rm -f /etc/systemd/system/ollama.service; systemctl daemon-reload; }"
                     win_uninstall = _ActionProgressWindow(
                         parent=window,
                         title=_("Uninstalling Ollama"),
