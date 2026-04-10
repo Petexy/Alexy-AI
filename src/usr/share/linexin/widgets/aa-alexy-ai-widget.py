@@ -152,7 +152,7 @@ class SudoManager:
                 input=(password + '\n'),
                 capture_output=True,
                 text=True,
-                env={'LC_ALL': 'C'}
+                env={**os.environ, 'LC_ALL': 'C'}
             )
             return result.returncode == 0
         except Exception as e:
@@ -294,9 +294,6 @@ class _OAuthPopupWindow(Adw.Window):
                 self.close()
             return False
         return True
-
-        self.connect("close-request", self._on_close)
-        GLib.timeout_add(500, self._poll_auth)
 
     def _poll_auth(self):
         if self.authenticated:
@@ -645,7 +642,7 @@ class _ActionProgressWindow(Adw.Window):
             GLib.timeout_add(1500, self.close)
         else:
             self.set_deletable(True)
-            self.status_label.set_label(_(f"Operation failed with exit code {rc}. Check console output."))
+            self.status_label.set_label(_("Operation failed with exit code {}. Check console output.").format(rc))
             self.success = False
 
     def handle_close(self, win):
@@ -1610,6 +1607,10 @@ class LinexinAISysadminWidget(Gtk.Box):
             proc = self.arecord_proc
             if proc:
                 proc.terminate() # type: ignore
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
                 self.arecord_proc = None
 
     def _play_activation_sound(self):
@@ -1649,7 +1650,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             }
             url = whisper_urls.get(self.whisper_model)
             if not url:
-                self.add_message_bubble("assistant", _(f"Unknown Whisper model: {self.whisper_model}"))
+                self.add_message_bubble("assistant", _("Unknown Whisper model: {}").format(self.whisper_model))
                 return
 
             model_sizes = {"tiny": "~39 MB", "base": "~74 MB", "small": "~461 MB", "medium": "~1.5 GB"}
@@ -1819,6 +1820,7 @@ class LinexinAISysadminWidget(Gtk.Box):
                 GLib.idle_add(self.entry.set_placeholder_text, _("Transcribing..."))
                 tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, prefix="linexin-stt-")
                 tmp_wav_path = tmp_wav.name
+                tmp_wav.close()
                 try:
                     with wave.open(tmp_wav_path, 'wb') as wf:
                         wf.setnchannels(1)
@@ -1856,7 +1858,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             self.stt_thread.start()
 
         except Exception as e:
-            self.add_message_bubble("assistant", _(f"Failed to start mic: {e}"))
+            self.add_message_bubble("assistant", _("Failed to start mic: {}").format(e))
             btn.set_active(False)
 
     @staticmethod
@@ -1948,7 +1950,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             self.vosk_model = vosk.Model(model_path)
             self.vosk_recognizer = vosk.KaldiRecognizer(self.vosk_model, 16000)
         except Exception as e:
-            self.add_message_bubble("assistant", _(f"Error loading voice model: {e}"))
+            self.add_message_bubble("assistant", _("Error loading voice model: {}").format(e))
             btn.set_active(False)
             return
 
@@ -2016,16 +2018,24 @@ class LinexinAISysadminWidget(Gtk.Box):
             self.stt_thread.start()
 
         except Exception as e:
-            self.add_message_bubble("assistant", _(f"Failed to start mic: {e}"))
+            self.add_message_bubble("assistant", _("Failed to start mic: {}").format(e))
+            if self.arecord_proc:
+                self.arecord_proc.terminate()
+                try:
+                    self.arecord_proc.wait(timeout=2)
+                except Exception:
+                    pass
+                self.arecord_proc = None
+            self.stt_running = False
             btn.set_active(False)
 
     def update_subtitle(self):
         if self.backend == "direct":
-            self.subtitle_label.set_label(_(f"Online API: {self.model}"))
+            self.subtitle_label.set_label(_("Online API: {}").format(self.model))
         elif self.backend == "qwen_cli":
             self.subtitle_label.set_label(_("Qwen CLI Wrapper"))
         elif self.backend == "local":
-            self.subtitle_label.set_label(_(f"Local AI: {self.local_model}"))
+            self.subtitle_label.set_label(_("Local AI: {}").format(self.local_model))
 
     def add_message_bubble(self, role, content, is_html=False):
         row = Gtk.ListBoxRow()
@@ -2745,6 +2755,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             return False
             
         window.connect("close-request", on_window_close_request)
+        translate_window(window)
         window.present()
 
     def get_qwen_env_cmd(self, base_cmd):
@@ -2806,7 +2817,7 @@ class LinexinAISysadminWidget(Gtk.Box):
                 os.remove(auth_file)
                 self.add_message_bubble("assistant", _("Logged out of Qwen CLI successfully."))
             except Exception as e:
-                self.add_message_bubble("assistant", _(f"Failed to logout: {e}"))
+                self.add_message_bubble("assistant", _("Failed to logout: {}").format(e))
             self.update_qwen_login_button()
         else:
             # perform login
@@ -2957,11 +2968,13 @@ class LinexinAISysadminWidget(Gtk.Box):
                     def err_response(d, r):
                         if cancel_callback: cancel_callback()
                     err_dlg.connect("response", err_response)
+                    translate_dialog(err_dlg)
                     err_dlg.present()
             else:
                 if cancel_callback: cancel_callback()
 
         dialog.connect("response", response_handler)
+        translate_dialog(dialog)
         dialog.present()
 
     def on_ollama_install_clicked(self, btn=None, callback=None):
@@ -3095,7 +3108,7 @@ class LinexinAISysadminWidget(Gtk.Box):
         Falls back to CLI tools if the portal is unavailable.
         """
         screenshot_dir = "/tmp/linexin"
-        os.makedirs(screenshot_dir, exist_ok=True)
+        os.makedirs(screenshot_dir, mode=0o700, exist_ok=True)
         screenshot_path = os.path.join(screenshot_dir, f"screen_{uuid.uuid4().hex}.png")
 
         captured = False
@@ -3746,6 +3759,7 @@ class LinexinAISysadminWidget(Gtk.Box):
                             on_safety_deny()
                             
                     dialog.connect("response", on_response)
+                    translate_dialog(dialog)
                     dialog.present()
                     
                 GLib.idle_add(show_safety_dialog)

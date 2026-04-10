@@ -166,4 +166,5 @@ translations = {
     'openai-whisper is not installed. Install it via: pip install openai-whisper': 'openai-whisper не установлен. Установите через: pip install openai-whisper',
     'python-vosk is not installed. You can install it from Settings.': 'python-vosk не установлен. Вы можете установить его из Настроек.',
     '⚠️ Error: ': '⚠️ Ошибка: ',
+    "Model '{}' not found locally. Downloading now...": "Model '{}' not found locally. Downloading now...",
 }
