@@ -1,0 +1,22 @@
+[project]
+name = "alexy-ai"
+version = "1.1.0"
+description = "Alexy Assistant"
+license = "GPL-3.0-only"
+requires-python = ">=3.10"
+authors = [
+    {name = "Petexy"},
+]
+dependencies = [
+    "PyGObject",
+    "openai-whisper",
+    "pyaudio",
+]
+
+[project.urls]
+Homepage = "https://github.com/Petexy/Alexy-AI"
+Repository = "https://github.com/Petexy/Alexy-AI"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
