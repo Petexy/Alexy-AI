@@ -1,8 +1,8 @@
 # Maintainer: Petexy <https://github.com/Petexy>
 
 pkgname=alexy-ai
-pkgver=1.1.0.r
-pkgrel=2
+pkgver=1.1.1.r
+pkgrel=1
 pkgdesc='Alexy Assistant'
 url='https://github.com/Petexy'
 arch=('x86_64')
