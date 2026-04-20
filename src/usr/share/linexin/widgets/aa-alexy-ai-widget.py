@@ -195,130 +195,8 @@ class SudoManager:
         except:
             pass
 
-class _OAuthPopupWindow(Adw.Window):
-    """Minimal popup for OAuth flows — no URL bar, no controls."""
-    def __init__(self, parent, url, on_closed_without_auth=None, auth_file=None):
-        super().__init__(title=_("Qwen CLI Login"), transient_for=parent, modal=True) # type: ignore
-        self.set_default_size(500, 650)
-        self.auth_file = auth_file or os.path.expanduser("~/.qwen/oauth_creds.json")
-        self.on_closed_without_auth = on_closed_without_auth
-        self.authenticated = False
-        self._browser_proc = None
-
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.set_content(box)
-        header = Adw.HeaderBar()
-        box.append(header)
-
-        # Try WebKitGTK first (embedded, best UX)
-        embedded = False
-        try:
-            gi.require_version("WebKit", "6.0") # type: ignore
-            from gi.repository import WebKit # type: ignore # pylint: disable=import-error
-            self.webview = WebKit.WebView()
-            self.webview.set_vexpand(True)
-            self.webview.set_hexpand(True)
-            box.append(self.webview)
-            self.webview.load_uri(url)
-            embedded = True
-        except Exception:
-            pass
-
-        if not embedded:
-            import shutil
-            browser_bin = None
-            browser_args = []
-            track_process = True  # whether we can rely on process exit to detect close
-
-            # Try Chromium/Chrome --app mode (minimal window, no URL bar)
-            for ch in ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome", "brave-browser", "microsoft-edge-stable"]:
-                found = shutil.which(ch)
-                if found:
-                    browser_bin = found
-                    browser_args = [f"--app={url}", "--no-first-run", "--disable-extensions"]
-                    break
-
-            # Fallback: Firefox in a new window.
-            # Firefox delegates to the running instance and exits immediately,
-            # so we cannot track the process — rely on auth-file polling only.
-            if not browser_bin:
-                for ff in ["firefox", "firefox-esr"]:
-                    found = shutil.which(ff)
-                    if found:
-                        browser_bin = found
-                        browser_args = ["--new-window", url]
-                        track_process = False
-                        break
-
-            # Other browsers (trackable process)
-            if not browser_bin:
-                for br in ["epiphany", "falkon"]:
-                    found = shutil.which(br)
-                    if found:
-                        browser_bin = found
-                        browser_args = [url]
-                        break
-
-            if browser_bin:
-                status = Gtk.Label(label=_("Complete the login in your browser, then close this window."))
-                status.set_wrap(True)
-                status.set_margin_top(24)
-                status.set_margin_start(12)
-                status.set_margin_end(12)
-                box.append(status)
-                self._browser_proc = subprocess.Popen(
-                    [browser_bin] + browser_args,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                if track_process:
-                    GLib.timeout_add(1000, self._check_browser_closed)
-            else:
-                # Last resort: xdg-open (full browser, can't track window close)
-                status = Gtk.Label(label=_("Complete the login in your browser, then close this window."))
-                status.set_wrap(True)
-                status.set_margin_top(24)
-                status.set_margin_start(12)
-                status.set_margin_end(12)
-                box.append(status)
-                subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        self.connect("close-request", self._on_close)
-        GLib.timeout_add(500, self._poll_auth)
-
-    def _check_browser_closed(self):
-        """Monitor the --app browser process; if user closes it, close this window."""
-        if self.authenticated:
-            return False
-        if self._browser_proc and self._browser_proc.poll() is not None:
-            if not self.authenticated:
-                self.close()
-            return False
-        return True
-
-    def _poll_auth(self):
-        if self.authenticated:
-            return False
-        try:
-            if os.path.exists(self.auth_file):
-                with open(self.auth_file, 'r') as f:
-                    data = f.read().strip()
-                if len(data) > 10:
-                    self.authenticated = True
-                    self.close()
-                    return False
-        except Exception:
-            pass
-        return True
-
-    def _on_close(self, win):
-        if self._browser_proc and self._browser_proc.poll() is None:
-            self._browser_proc.terminate()
-        if not self.authenticated and self.on_closed_without_auth:
-            self.on_closed_without_auth()
-        return False
-
 class _ActionProgressWindow(Adw.Window):
-    def __init__(self, parent=None, title="", cmd_string="", is_ollama=False, initial_status=None, on_close_callback=None, poll_auth_file=False, sudo_manager=None, model_name=None, **kwargs):
+    def __init__(self, parent=None, title="", cmd_string="", is_ollama=False, initial_status=None, on_close_callback=None, sudo_manager=None, model_name=None, **kwargs):
         if not cmd_string:
             super().__init__()
             return
@@ -330,24 +208,11 @@ class _ActionProgressWindow(Adw.Window):
         self.on_close_callback = on_close_callback
         self.success = False
         self.process_finished = False
-        self.poll_auth_file = poll_auth_file
         self.process: Optional[subprocess.Popen[bytes]] = None
         self.sudo_manager = sudo_manager
         self._has_real_progress = False
         self.set_deletable(False)
         self.connect("close-request", self.handle_close)
-        self._oauth_popup = None
-        self._last_error_line = None
-
-        # Detect WebKitGTK once so we know whether to embed or delegate to CLI
-        self._has_webkit = False
-        if self.poll_auth_file:
-            try:
-                gi.require_version("WebKit", "6.0")  # type: ignore
-                from gi.repository import WebKit  # type: ignore # noqa: F401 pylint: disable=import-error,unused-import
-                self._has_webkit = True
-            except Exception:
-                pass
         
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_content(box)
@@ -376,16 +241,12 @@ class _ActionProgressWindow(Adw.Window):
         self.progress = Gtk.ProgressBar()
         self.progress.set_margin_top(12)
         if not self.is_ollama:
-            # We don't have easy percentage streaming for qwen install, so we pulse
             self.progress.set_pulse_step(0.1)
             GLib.timeout_add(100, self.pulse_progress)
         content.append(self.progress)
         
         # Start the subprocess in a background thread
         threading.Thread(target=self.run_process, daemon=True).start()
-        
-        if self.poll_auth_file:
-            GLib.timeout_add(100, self.check_auth_file)
 
     def pulse_progress(self):
         if not self.process_finished and not self.is_ollama and not self._has_real_progress:
@@ -399,32 +260,11 @@ class _ActionProgressWindow(Adw.Window):
             if self.sudo_manager:
                 self.sudo_manager.start_privileged_session()
                 cmd_args = [self.sudo_manager.wrapper_path] + cmd_args
-                
-            env = None
-            self._noop_browser_dir = None
-            if self.poll_auth_file and self._has_webkit:
-                # Suppress ALL browser launches from the CLI subprocess so only
-                # our embedded WebKit popup opens.  Node.js 'open' uses xdg-open
-                # on Linux and ignores $BROWSER, so we must shadow the actual
-                # browser binaries with a no-op script in PATH.
-                env = os.environ.copy()
-                env["BROWSER"] = "/bin/true"
-                noop_dir = tempfile.mkdtemp(prefix="linexin-noop-")
-                noop_script = os.path.join(noop_dir, "xdg-open")
-                with open(noop_script, "w") as _f:
-                    _f.write("#!/bin/sh\nexit 0\n")
-                os.chmod(noop_script, 0o700)
-                # Shadow common browser binaries too (some CLIs call them directly)
-                for _name in ["firefox", "firefox-esr", "chromium", "google-chrome-stable", "sensible-browser"]:
-                    os.symlink(noop_script, os.path.join(noop_dir, _name))
-                env["PATH"] = noop_dir + ":" + env.get("PATH", "")
-                self._noop_browser_dir = noop_dir
             
             self.process = subprocess.Popen(
                 cmd_args,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env=env
+                stderr=subprocess.STDOUT
             )
             
             process = self.process
@@ -451,27 +291,14 @@ class _ActionProgressWindow(Adw.Window):
             
             if self.sudo_manager:
                 self.sudo_manager.stop_privileged_session()
-            self._cleanup_noop_dir()
                 
             GLib.idle_add(self.on_finish, process.returncode if process else 1)
         except Exception as e:
             self.process_finished = True
             if self.sudo_manager:
                 self.sudo_manager.stop_privileged_session()
-            self._cleanup_noop_dir()
             print(f"Error launching process: {str(e)}")
             GLib.idle_add(self.status_label.set_label, _("Process failed to start."))
-
-    def _cleanup_noop_dir(self):
-        """Remove the temporary no-op browser directory."""
-        d = getattr(self, '_noop_browser_dir', None)
-        if d and os.path.isdir(d):
-            try:
-                import shutil
-                shutil.rmtree(d, ignore_errors=True)
-            except Exception:
-                pass
-            self._noop_browser_dir = None
 
     def parse_and_append(self, line):
         # Print raw output to the shell for debugging
@@ -507,39 +334,6 @@ class _ActionProgressWindow(Adw.Window):
         if re.match(r'^[⸩⸨()\[\]#=>.\-\s⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]+$', filtered_line):
             return False
         
-        # Intercept OAuth URLs
-        if self.poll_auth_file and not self._oauth_popup:
-            # Capture error messages from the CLI for better reporting
-            lower = filtered_line.lower()
-            if 'failed' in lower or 'error' in lower:
-                self._last_error_line = filtered_line
-            
-            url_match = re.search(r'https?://\S+', filtered_line)
-            if url_match:
-                url = url_match.group(0)
-                self.status_label.set_label(_("Waiting for authorization to complete..."))
-                if self._has_webkit:
-                    # WebKitGTK available → open embedded popup (CLI browser suppressed)
-                    def on_popup_closed_without_auth():
-                        self.success = False
-                        self.process_finished = True
-                        process = self.process
-                        if process:
-                            process.terminate()
-                        self.status_label.set_label(_("Authorization was cancelled."))
-                        self.set_deletable(True)
-                        GLib.timeout_add(1500, self.close)
-                    self._oauth_popup = _OAuthPopupWindow(
-                        parent=self,
-                        url=url,
-                        on_closed_without_auth=on_popup_closed_without_auth
-                )
-                    self._oauth_popup.present()
-                else:
-                    # No WebKitGTK → CLI opened browser natively, just mark URL seen
-                    self._oauth_popup = True  # prevents re-entry
-                return False
-            
         if self.is_ollama:
             import re
             display_name = self.model_name or _("model")
@@ -574,64 +368,8 @@ class _ActionProgressWindow(Adw.Window):
             
         return False
         
-    def check_auth_file(self):
-        if self.process_finished:
-            return False
-            
-        auth_file = os.path.expanduser("~/.qwen/oauth_creds.json")
-        if os.path.exists(auth_file):
-            try:
-                # Check if it actually contains JSON data instead of an empty file
-                with open(auth_file, 'r') as f:
-                    data = f.read().strip()
-                    if len(data) > 10:
-                        self.success = True
-                        self.process_finished = True
-                        self.status_label.set_label(_("Authentication successful!"))
-                        self.progress.set_fraction(1.0)
-                        process = self.process
-                        if process:
-                            process.terminate()
-                        self.set_deletable(True)
-                        GLib.timeout_add(1500, self.close)
-                        return False
-            except Exception:
-                pass
-        return True
-
     def on_finish(self, rc):
         if self.success:
-            return # Forcefully succeeded by auth poller already
-
-        # If popup was cancelled, don't overwrite the "cancelled" message
-        if self.poll_auth_file and isinstance(self._oauth_popup, _OAuthPopupWindow) and not self._oauth_popup.authenticated:
-            self.set_deletable(True)
-            return
-
-        # For OAuth flows, the CLI may exit non-zero even though auth succeeded
-        if self.poll_auth_file and rc != 0:
-            auth_file = os.path.expanduser("~/.qwen/oauth_creds.json")
-            try:
-                if os.path.exists(auth_file):
-                    with open(auth_file, 'r') as f:
-                        data = f.read().strip()
-                    if len(data) > 10:
-                        self.status_label.set_label(_("Authentication successful!"))
-                        self.progress.set_fraction(1.0)
-                        self.success = True
-                        self.set_deletable(True)
-                        GLib.timeout_add(1500, self.close)
-                        return
-            except Exception:
-                pass
-            # Show a user-friendly error for OAuth failures
-            if self._last_error_line:
-                truncated = (self._last_error_line[:80] + '...') if len(self._last_error_line) > 80 else self._last_error_line
-                self.status_label.set_label(truncated)
-            else:
-                self.status_label.set_label(_("Authentication failed. The Qwen OAuth service may be unavailable. Please try again later."))
-            self.set_deletable(True)
-            self.success = False
             return
 
         if rc == 0:
@@ -795,7 +533,7 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.arecord_proc: Optional[subprocess.Popen[bytes]] = None
         
         # Default config
-        self.backend = "qwen_cli" # "direct", "qwen_cli", "local"
+        self.backend = "local" # "direct" or "local"
         
         # Direct API Config
         self.api_key = ""
@@ -814,7 +552,6 @@ class LinexinAISysadminWidget(Gtk.Box):
         
         # Per-backend voice correction toggles
         self.voice_correction_direct = False
-        self.voice_correction_qwen = False
         
         # Screen Awareness
         self.screen_awareness_active = False
@@ -875,8 +612,6 @@ class LinexinAISysadminWidget(Gtk.Box):
 
     def _reset_history(self):
         self.chat_history = [{"role": "system", "content": self.system_prompt}]
-        self.qwen_session_id = str(uuid.uuid4())
-        self.qwen_session_started = False
 
     def _clear_chat_ui(self):
         """Remove all message bubbles from the chat listbox."""
@@ -917,7 +652,6 @@ class LinexinAISysadminWidget(Gtk.Box):
             "created": getattr(self, '_conv_created', datetime.now().isoformat()),
             "updated": datetime.now().isoformat(),
             "backend": self.backend,
-            "qwen_session_id": self.qwen_session_id,
             "chat_history": self.chat_history
         }
         if not hasattr(self, '_conv_created'):
@@ -947,18 +681,12 @@ class LinexinAISysadminWidget(Gtk.Box):
         self._conv_created = conv_data.get("created", "")
         # Restore the backend the conversation was created with
         saved_backend = conv_data.get("backend", self.backend)
+        # Migrate removed qwen_cli backend to direct
+        if saved_backend == "qwen_cli":
+            saved_backend = "direct"
         if saved_backend != self.backend:
             self.backend = saved_backend
             self.update_subtitle()
-        # Restore Qwen CLI session if applicable
-        saved_qwen_id = conv_data.get("qwen_session_id")
-        if saved_qwen_id and conv_data.get("backend") == "qwen_cli":
-            self.qwen_session_id = saved_qwen_id
-            # Session already exists on Qwen's side, so use --resume
-            self.qwen_session_started = True
-        else:
-            self.qwen_session_id = str(uuid.uuid4())
-            self.qwen_session_started = False
         # Rebuild the chat UI, skipping internal system/command messages
         self._clear_chat_ui()
         import re as _re
@@ -988,8 +716,13 @@ class LinexinAISysadminWidget(Gtk.Box):
             try:
                 with open(filepath, 'r') as f:
                     data = json.load(f)
-                if backend_filter and data.get("backend") != backend_filter:
-                    continue
+                if backend_filter:
+                    conv_backend = data.get("backend")
+                    # Migrate removed qwen_cli backend to direct
+                    if conv_backend == "qwen_cli":
+                        conv_backend = "direct"
+                    if conv_backend != backend_filter:
+                        continue
                 conversations.append((
                     data.get("id", filename.replace(".json", "")),
                     data.get("title", _("Untitled")),
@@ -1047,7 +780,6 @@ class LinexinAISysadminWidget(Gtk.Box):
         all_conversations = self._list_conversations()
         backend_labels = {
             "direct": _("Online API"),
-            "qwen_cli": _("Qwen CLI"),
             "local": _("Local AI")
         }
         available_backends = set()
@@ -1059,6 +791,10 @@ class LinexinAISysadminWidget(Gtk.Box):
                 available_backends.add(data.get("backend", ""))
             except Exception:
                 pass
+        # Migrate removed qwen_cli backend to direct
+        if "qwen_cli" in available_backends:
+            available_backends.discard("qwen_cli")
+            available_backends.add("direct")
         available_backends.add(self.backend)
 
         # Destroy old filter bar and create a fresh one
@@ -1072,6 +808,9 @@ class LinexinAISysadminWidget(Gtk.Box):
 
         if not hasattr(self, '_conv_active_filter'):
             self._conv_active_filter = self.backend
+        # Migrate removed qwen_cli filter
+        if self._conv_active_filter == "qwen_cli":
+            self._conv_active_filter = "direct"
 
         if len(available_backends) > 1:
             filter_label = Gtk.Label(label=_("Backend:"))
@@ -1082,7 +821,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             btn_group.add_css_class("linked")
 
             first_btn = None
-            backend_order = ["direct", "qwen_cli", "local"]
+            backend_order = ["direct", "local"]
             for backend_key in backend_order:
                 if backend_key not in available_backends:
                     continue
@@ -1330,6 +1069,9 @@ class LinexinAISysadminWidget(Gtk.Box):
                 with open(CONFIG_FILE, 'r') as f:
                     config = json.load(f)
                     self.backend = config.get("backend", self.backend)
+                    # Migrate removed qwen_cli backend to direct
+                    if self.backend == "qwen_cli":
+                        self.backend = "direct"
                     self.api_key = config.get("api_key", self.api_key)
                     self.api_url = config.get("api_url", self.api_url)
                     self.model = config.get("model", self.model)
@@ -1340,7 +1082,6 @@ class LinexinAISysadminWidget(Gtk.Box):
                     self.vosk_lang = config.get("vosk_lang", "small-en-us-0.15")
                     self.hey_linux_enabled = config.get("hey_linux_enabled", False)
                     self.voice_correction_direct = config.get("voice_correction_direct", False)
-                    self.voice_correction_qwen = config.get("voice_correction_qwen", False)
                     self.auto_execute_commands = config.get("auto_execute_commands", True)
                     self.compact_screen_awareness = config.get("compact_screen_awareness", True)
                     self.theme = config.get("theme", "default")
@@ -1363,7 +1104,6 @@ class LinexinAISysadminWidget(Gtk.Box):
                     "vosk_lang": self.vosk_lang,
                     "hey_linux_enabled": self.hey_linux_enabled,
                     "voice_correction_direct": self.voice_correction_direct,
-                    "voice_correction_qwen": self.voice_correction_qwen,
                     "auto_execute_commands": self.auto_execute_commands,
                     "compact_screen_awareness": self.compact_screen_awareness,
                     "theme": self.theme
@@ -1679,8 +1419,7 @@ class LinexinAISysadminWidget(Gtk.Box):
                 title=_("Downloading Voice Recognition Model"),
                 cmd_string=download_cmd,
                 is_ollama=True,  # enables percentage-based progress bar parsing
-                initial_status=_("Downloading Whisper {} model ({})...").format(self.whisper_model, size_label),
-                poll_auth_file=False
+                initial_status=_('Downloading Whisper {} model ({})...').format(self.whisper_model, size_label)
             )
             def on_whisper_download_done(success):
                 if success:
@@ -1925,8 +1664,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             win = _ActionProgressWindow(
                 parent=self.window if self.window else self.get_root(),
                 title=_("Downloading Offline Voice Model"),
-                cmd_string=full_cmd_str,
-                poll_auth_file=False
+                cmd_string=full_cmd_str
             )
 
             def on_download_done(success):
@@ -2032,8 +1770,6 @@ class LinexinAISysadminWidget(Gtk.Box):
     def update_subtitle(self):
         if self.backend == "direct":
             self.subtitle_label.set_label(_("Online API: {}").format(self.model))
-        elif self.backend == "qwen_cli":
-            self.subtitle_label.set_label(_("Qwen CLI Wrapper"))
         elif self.backend == "local":
             self.subtitle_label.set_label(_("Local AI: {}").format(self.local_model))
 
@@ -2226,16 +1962,13 @@ class LinexinAISysadminWidget(Gtk.Box):
         backend_row = Adw.ComboRow(title=_("Backend Type"))
         model = Gtk.StringList()
         model.append(_("Direct API (Online)"))
-        model.append(_("Qwen CLI Wrapper"))
         model.append(_("Local AI (Ollama)"))
         backend_row.set_model(model)
         
         if self.backend == "direct":
             backend_row.set_selected(0)
-        elif self.backend == "qwen_cli":
-            backend_row.set_selected(1)
         elif self.backend == "local":
-            backend_row.set_selected(2)
+            backend_row.set_selected(1)
             
         general_group.add(backend_row)
 
@@ -2254,25 +1987,6 @@ class LinexinAISysadminWidget(Gtk.Box):
         model_entry = Adw.EntryRow(title=_("Model"))
         model_entry.set_text(self.model)
         direct_group.add(model_entry)
-
-        # Dynamic Qwen CLI Group
-        qwen_group = Adw.PreferencesGroup(description=_("Wraps the Qwen official CLI utility. No API key needed here; login through the CLI instead."))
-        page_llm.add(qwen_group)
-        
-        install_row = Adw.ActionRow(title=_("Install / Update Qwen CLI"))
-        install_btn = Gtk.Button(label=_("Install / Update"), valign=Gtk.Align.CENTER)
-        install_btn.connect("clicked", self.on_qwen_install_clicked)
-        install_row.add_suffix(install_btn)
-        install_row.set_activatable_widget(install_btn)
-        qwen_group.add(install_row)
-
-        login_row = Adw.ActionRow(title=_("Qwen CLI Authentication"))
-        self.login_btn = Gtk.Button(valign=Gtk.Align.CENTER)
-        self.update_qwen_login_button()
-        self.login_btn.connect("clicked", self.on_qwen_auth_clicked)
-        login_row.add_suffix(self.login_btn)
-        login_row.set_activatable_widget(self.login_btn)
-        qwen_group.add(login_row)
 
         # Dynamic Local AI Group
         local_group = Adw.PreferencesGroup(title=_("Local AI"), description=_("Uses Ollama daemon sequentially running on localhost:11434."))
@@ -2305,7 +2019,6 @@ class LinexinAISysadminWidget(Gtk.Box):
                         parent=window,
                         title=_("Uninstalling Ollama"),
                         cmd_string=cmd,
-                        poll_auth_file=False,
                         sudo_manager=self.sudo_manager
                     )
                     def on_uninstall_done(success):
@@ -2342,7 +2055,6 @@ class LinexinAISysadminWidget(Gtk.Box):
                     parent=window,
                     title=_("Installing Ollama"),
                     cmd_string=cmd,
-                    poll_auth_file=False,
                     sudo_manager=self.sudo_manager,
                     initial_status=_("Downloading and installing Ollama daemon...")
                 )
@@ -2428,9 +2140,8 @@ class LinexinAISysadminWidget(Gtk.Box):
         def sync_backend_visibility(*args):
             idx = backend_row.get_selected()
             direct_group.set_visible(idx == 0)
-            qwen_group.set_visible(idx == 1)
-            local_group.set_visible(idx == 2)
-            pull_group.set_visible(idx == 2)
+            local_group.set_visible(idx == 1)
+            pull_group.set_visible(idx == 1)
 
         backend_row.connect("notify::selected", sync_backend_visibility)
         sync_backend_visibility() # apply initial state
@@ -2499,7 +2210,6 @@ class LinexinAISysadminWidget(Gtk.Box):
                         parent=window,
                         title=_("Installing python-vosk"),
                         cmd_string="pacman -Sy python-vosk --noconfirm",
-                        poll_auth_file=False,
                         sudo_manager=self.sudo_manager
                     )
                     def on_install_done(success):
@@ -2587,17 +2297,13 @@ class LinexinAISysadminWidget(Gtk.Box):
 
         vc_group = Adw.PreferencesGroup(
             title=_("Voice Correction"), 
-            description=_("Use an LLM to automatically fix transcribing errors. Note: This currently only functions when an online model (Direct API / Qwen CLI) is actively configured.")
+            description=_("Use an LLM to automatically fix transcribing errors. Note: This currently only functions when an online model (Direct API) is actively configured.")
         )
         page_speech.add(vc_group)
 
         direct_vc_row = Adw.SwitchRow(title=_("Enable for Direct API"))
         direct_vc_row.set_active(self.voice_correction_direct)
         vc_group.add(direct_vc_row)
-
-        qwen_vc_row = Adw.SwitchRow(title=_("Enable for Qwen CLI wrapper"))
-        qwen_vc_row.set_active(self.voice_correction_qwen)
-        vc_group.add(qwen_vc_row)
 
         # Page 3: Theme
         page_theme = Adw.PreferencesPage(title=_("Theme"), icon_name="applications-graphics-symbolic")
@@ -2683,8 +2389,6 @@ class LinexinAISysadminWidget(Gtk.Box):
             if idx == 0:
                 self.backend = "direct"
             elif idx == 1:
-                self.backend = "qwen_cli"
-            elif idx == 2:
                 self.backend = "local"
             
             if old_backend != self.backend:
@@ -2723,7 +2427,6 @@ class LinexinAISysadminWidget(Gtk.Box):
             self._check_stt_availability()
                 
             self.voice_correction_direct = direct_vc_row.get_active()
-            self.voice_correction_qwen = qwen_vc_row.get_active()
             self.auto_execute_commands = auto_exec_row.get_active()
             self.compact_screen_awareness = compact_screen_row.get_active()
 
@@ -2758,18 +2461,7 @@ class LinexinAISysadminWidget(Gtk.Box):
         translate_window(window)
         window.present()
 
-    def get_qwen_env_cmd(self, base_cmd):
-        """Helper to try resolving qwen-code from user's global npm dir and nvm"""
-        # A bash wrapper that sources nvm and tries to run the command
-        wrapper = (
-            "export NVM_DIR=\"$HOME/.nvm\"; "
-            "[ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\"; "
-            "export PATH=\"$HOME/.npm-global/bin:$PATH\"; "
-            f"{base_cmd}"
-        )
-        return wrapper
-
-    def launch_in_app_process(self, title, cmd_string, is_ollama=False, initial_status=None, on_close_callback=None, poll_auth_file=False, sudo_manager=None, model_name=None):
+    def launch_in_app_process(self, title, cmd_string, is_ollama=False, initial_status=None, on_close_callback=None, sudo_manager=None, model_name=None):
         """Robustly launch a subprocess and stream its output to a native GTK _ActionProgressWindow."""
         win = _ActionProgressWindow(
             parent=self.window if self.window else self.get_root(),
@@ -2778,64 +2470,10 @@ class LinexinAISysadminWidget(Gtk.Box):
             is_ollama=is_ollama,
             initial_status=initial_status,
             on_close_callback=on_close_callback,
-            poll_auth_file=poll_auth_file,
             sudo_manager=sudo_manager,
             model_name=model_name
         )
         win.present()
-
-    def is_qwen_installed(self):
-        cmd = self.get_qwen_env_cmd("command -v qwen >/dev/null 2>&1 || command -v qwen-code >/dev/null 2>&1")
-        rc = subprocess.run(["bash", "-c", cmd]).returncode
-        return rc == 0
-
-    def on_qwen_install_clicked(self, btn=None, callback=None):
-        # Run the installer, then verify the binary exists (the script may exit non-zero despite success)
-        # Use get_qwen_env_cmd so nvm is sourced — the binary may only be findable through nvm's PATH.
-        verify = self.get_qwen_env_cmd("command -v qwen >/dev/null 2>&1 || command -v qwen-code >/dev/null 2>&1")
-        cmd = f'curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.sh | bash -s -- --source qwenchat 2>&1; {verify}'
-        self.launch_in_app_process(_("Installing Qwen CLI"), cmd, initial_status=_("Preparing installation scripts..."), on_close_callback=callback)
-
-    def update_qwen_login_button(self):
-        if not hasattr(self, 'login_btn') or not self.login_btn:
-            return
-        auth_file = os.path.expanduser("~/.qwen/oauth_creds.json")
-        if os.path.exists(auth_file):
-            self.login_btn.set_label(_("Logout of Qwen CLI"))
-            self.login_btn.remove_css_class("suggested-action")
-            self.login_btn.add_css_class("destructive-action")
-        else:
-            self.login_btn.set_label(_("Login to Qwen CLI (OAuth)"))
-            self.login_btn.remove_css_class("destructive-action")
-            self.login_btn.add_css_class("suggested-action")
-
-    def on_qwen_auth_clicked(self, btn=None, callback=None):
-        auth_file = os.path.expanduser("~/.qwen/oauth_creds.json")
-        if os.path.exists(auth_file) and btn is not None:
-            # perform logout
-            try:
-                os.remove(auth_file)
-                self.add_message_bubble("assistant", _("Logged out of Qwen CLI successfully."))
-            except Exception as e:
-                self.add_message_bubble("assistant", _("Failed to logout: {}").format(e))
-            self.update_qwen_login_button()
-        else:
-            # perform login
-            if not self.is_qwen_installed():
-                def after_install(success):
-                    if success:
-                        self.on_qwen_auth_clicked(None, callback)
-                    elif callback:
-                        callback(False)
-                self.on_qwen_install_clicked(None, callback=after_install)
-                return
-                
-            cmd = self.get_qwen_env_cmd("qwen --auth-type qwen-oauth -p ' '")
-            def after_login(success):
-                self.update_qwen_login_button()
-                if callback:
-                    callback(success)
-            self.launch_in_app_process(_("Qwen CLI Login"), cmd, initial_status=_("Waiting for Qwen OAuth URL generation..."), on_close_callback=after_login, poll_auth_file=True)
 
     def on_pull_ollama_clicked(self, model_name, callback=None, combo_row=None):
         if not model_name:
@@ -3013,10 +2651,6 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.new_conv_btn.set_sensitive(True)
         self.conv_toggle_btn.set_sensitive(True)
         self.settings_btn.set_sensitive(True)
-        if hasattr(self, 'qwen_proc') and self.qwen_proc:
-            try:
-                self.qwen_proc.terminate()
-            except: pass
         self.add_message_bubble("assistant", _("Generation stopped by user."))
 
     def _stop_tts(self):
@@ -3068,21 +2702,6 @@ class LinexinAISysadminWidget(Gtk.Box):
                     result = json.loads(response.read().decode('utf-8'))
                     corrected = result['choices'][0]['message']['content'].strip()
                     return corrected if corrected else raw_text
-
-            elif self.backend == "qwen_cli":
-                import shlex
-                escaped = shlex.quote(correction_prompt + "\n\nText: " + raw_text)
-                cli_cmds = ["qwen", "qwen-code"]
-                for cmd in cli_cmds:
-                    try:
-                        bash_wrapper = self.get_qwen_env_cmd(f"{cmd} {escaped} --auth-type qwen-oauth --yolo")
-                        proc = subprocess.Popen(["bash", "-c", bash_wrapper], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                        stdout, stderr = proc.communicate(timeout=60)
-                        if proc.returncode == 0 and stdout.strip():
-                            return stdout.strip()
-                    except Exception:
-                        continue
-                return raw_text
 
         except Exception as e:
             print(f"[Voice correction] Failed, using raw text: {e}")
@@ -3263,9 +2882,9 @@ class LinexinAISysadminWidget(Gtk.Box):
             return None
 
     def _cleanup_screenshot_tmp(self):
-        """Remove the /tmp/linexin and ~/.qwen/tmp screenshot directories and all their contents."""
+        """Remove the /tmp/linexin screenshot directory and all its contents."""
         import shutil
-        for screenshot_dir in ["/tmp/linexin", os.path.expanduser("~/.qwen/tmp")]:
+        for screenshot_dir in ["/tmp/linexin"]:
             if os.path.isdir(screenshot_dir):
                 try:
                     shutil.rmtree(screenshot_dir)
@@ -3476,8 +3095,7 @@ class LinexinAISysadminWidget(Gtk.Box):
 
         # Check if voice correction is enabled for the active backend
         vc_enabled = (
-            (self.backend == "direct" and self.voice_correction_direct) or
-            (self.backend == "qwen_cli" and self.voice_correction_qwen)
+            (self.backend == "direct" and self.voice_correction_direct)
         )
 
         if is_voice and vc_enabled:
@@ -3596,8 +3214,6 @@ class LinexinAISysadminWidget(Gtk.Box):
     def call_ai(self):
         if self.backend == "direct":
             self.call_direct_api()
-        elif self.backend == "qwen_cli":
-            self.call_qwen_cli()
         elif self.backend == "local":
             self.call_local_ollama()
 
@@ -3878,175 +3494,11 @@ class LinexinAISysadminWidget(Gtk.Box):
             self.chat_history.append({"role": "user", "content": sys_msg}) # type: ignore
             
             # Re-fire API recursively in the background thread
-            if self.backend == 'qwen_cli':
-                self.call_qwen_cli(is_followup=True) # type: ignore
-            elif self.backend == 'local':
+            if self.backend == 'local':
                 self.call_local_ollama() # type: ignore
             else:
                 self.call_direct_api() # type: ignore
         return True
-
-    def call_qwen_cli(self, is_followup=False):
-        # Prevent exit code 127 if trying to interact with something that isn't installed.
-        if not self.is_qwen_installed():
-            def after_install(success):
-                if success:
-                    threading.Thread(target=self.call_qwen_cli).start()
-                else:
-                    GLib.idle_add(self.on_api_error, _("Qwen CLI installation was cancelled or failed."))
-            GLib.idle_add(self.on_qwen_install_clicked, None, after_install)
-            return
-            
-        # Explicitly check for OAuth credentials before passing to Qwen CLI. 
-        # If we pass a prompt unauthenticated, Qwen opens a browser window and hangs our subprocess forever.
-        auth_file = os.path.expanduser("~/.qwen/oauth_creds.json")
-        if not os.path.exists(auth_file):
-            def after_auth(success):
-                if success:
-                    threading.Thread(target=self.call_qwen_cli).start()
-                else:
-                    GLib.idle_add(self.on_api_error, _("Qwen CLI authentication was cancelled or failed."))
-            GLib.idle_add(self.on_qwen_auth_clicked, None, after_auth)
-            return
-
-        # We pass the latest message plus an explicit role preamble.
-        # Qwen's internal SQLite database handles conversation memory via --chat-recording,
-        # but it does not automatically inherit this widget's Python-side system message.
-        latest_content = self.chat_history[-1]['content']
-        latest_msg = self._extract_text_from_content(latest_content)
-        
-        # Qwen CLI supports vision via local file paths — save images to /tmp/linexin/
-        image_paths = []
-        if isinstance(latest_content, list) and self._extract_images_from_content(latest_content):
-            tmp_dir = os.path.expanduser("~/.qwen/tmp")
-            os.makedirs(tmp_dir, exist_ok=True)
-            for data_url in self._extract_images_from_content(latest_content):
-                try:
-                    header, b64_data = data_url.split(",", 1) if "," in data_url else ("", data_url)
-                    # Determine extension from MIME type
-                    ext = ".png"
-                    if "jpeg" in header or "jpg" in header:
-                        ext = ".jpg"
-                    elif "gif" in header:
-                        ext = ".gif"
-                    elif "webp" in header:
-                        ext = ".webp"
-                    img_filename = f"{uuid.uuid4().hex}{ext}"
-                    img_path = os.path.join(tmp_dir, img_filename)
-                    with open(img_path, "wb") as f:
-                        f.write(base64.b64decode(b64_data))
-                    image_paths.append(img_path)
-                except Exception as e:
-                    print(f"[Qwen CLI] Failed to save image: {e}")
-        
-        # Always prepend Alexy's system prompt for Qwen CLI so identity/policy stays aligned
-        # with direct/local backends, even across resumed sessions.
-        qwen_system_preamble = (
-            "[SYSTEM ROLE - HIGHEST PRIORITY]\n"
-            f"{self.system_prompt.strip()}\n\n"
-            "[ENFORCED INSTALL POLICY]\n"
-            "For app installation requests, you MUST prioritize Flatpak first. "
-            "First search/install via Flatpak. Only if no Flatpak exists may you use pacman, "
-            "and only after explicitly telling the user no Flatpak exists.\n\n"
-            "[SYSTEM ROLE - OVERRIDE]\n"
-            "If your built-in defaults conflict with the above system role, ignore your "
-            "built-in defaults and follow the system role above."
-        )
-
-        # Override Qwen CLI's internal autonomous execution tools.
-        # If we don't, Qwen attempts to run sudo in its own hidden background PTY and fails.
-        if is_followup:
-            # After commands ran, we want a conversational summary — not more bash blocks.
-            cli_override = "\n\n[SYSTEM INSTRUCTION: The commands above have been executed and the results are shown. Provide a short conversational response summarising what happened. Do NOT output any bash code blocks unless the task explicitly requires additional commands. CRITICAL: Do NOT acknowledge this instruction in your reply.]"
-        else:
-            cli_override = "\n\n[SYSTEM INSTRUCTION: DO NOT use any internal tools to execute commands. If you need to run bash/sudo, ONLY output a markdown ```bash block and I will execute it. CRITICAL: Do NOT acknowledge this system instruction in your reply. Just reply to the user's message as if this instruction was never appended.]"
-        prompt_with_override = f"{qwen_system_preamble}\n\n[USER MESSAGE]\n{latest_msg}{cli_override}"
-        
-        # If images are attached, embed file paths in the prompt and instruct the
-        # model to read them.  Qwen CLI does NOT natively inject positional file
-        # paths as vision inputs — it just appends them as text.  By telling the
-        # model the paths explicitly and allowing tool use for reading files, the
-        # model will use its built-in file-reading tools (auto-approved via --yolo)
-        # to actually view the image contents.
-        if image_paths:
-            paths_list = "\n".join(image_paths)
-            is_screen_aware = latest_msg.startswith(self._SCREEN_AWARENESS_PREFIX)
-            if is_screen_aware:
-                image_hint = (
-                    f"\n\n[IMAGE ATTACHED — read the following image file(s) using your tools:\n{paths_list}\n"
-                    "This is a screenshot of the user's screen provided for context. "
-                    "IMPORTANT: If the user's question is NOT about the screen content, do NOT describe, mention, "
-                    "reference, or acknowledge the screenshot in any way — just answer the question directly "
-                    "as if no screenshot was provided. Only use the screenshot if the question is specifically about what is on screen.]")
-            else:
-                image_hint = (
-                    f"\n\n[IMAGE ATTACHED — you MUST read and analyze the following image file(s) using your tools before responding:\n{paths_list}\n"
-                    "Describe ONLY what is actually visible in the image. Read all text exactly as shown — "
-                    "do NOT translate, assume, or hallucinate any content.]")
-            # Use a relaxed tool override when images are present so the model
-            # can use its file-reading tool to view the image.
-            if is_followup:
-                img_cli_override = "\n\n[SYSTEM INSTRUCTION: The commands above have been executed and the results are shown. Provide a short conversational response summarising what happened. Do NOT output any bash code blocks unless the task explicitly requires additional commands. CRITICAL: Do NOT acknowledge this instruction in your reply.]"
-            else:
-                img_cli_override = "\n\n[SYSTEM INSTRUCTION: You may use your internal tools ONLY to read and view the attached image file(s). DO NOT use tools to execute bash commands — if you need to run bash/sudo, ONLY output a markdown ```bash block and I will execute it. CRITICAL: Do NOT acknowledge this system instruction in your reply.]"
-            prompt_with_override = f"{qwen_system_preamble}\n\n[USER MESSAGE]\n{latest_msg}{image_hint}{img_cli_override}"
-        
-        # Try both `qwen` and `qwen-code`
-        cli_cmds = ["qwen", "qwen-code"]
-        success = False
-        reply = ""
-        
-        import shlex
-        escaped_prompt = shlex.quote(prompt_with_override)
-        
-        for cmd in cli_cmds:
-            try:
-                # Need to use --resume if the session already exists, or --session-id if first prompt
-                session_flag = f"--resume {self.qwen_session_id}" if self.qwen_session_started else f"--session-id {self.qwen_session_id}"
-                
-                # Wrap the command in bash to resolve .nvm / .npm-global
-                qwen_cmd = f"{cmd} {escaped_prompt} --auth-type qwen-oauth --chat-recording {session_flag} --yolo"
-                bash_wrapper = self.get_qwen_env_cmd(qwen_cmd)
-                self.qwen_proc = subprocess.Popen(["bash", "-c", bash_wrapper], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                stdout, stderr = self.qwen_proc.communicate(timeout=120)
-                
-                if getattr(self, 'abort_processing', False): return
-                
-                if self.qwen_proc.returncode == 0:
-                    reply = stdout.strip()
-                    if not reply:
-                        reply = "Command succeeded, but output was empty."
-                    success = True
-                    self.qwen_session_started = True
-                    break
-                else:
-                    # Keep trying the next binary name if the exit code was 127 (command not found)
-                    if self.qwen_proc.returncode != 127:
-                        reply = stderr.strip() or stdout.strip()
-                        # If the error wasn't cmd-not-found, we should probably record it but maybe keep trying?
-                        # Usually if qwen exists but fails, we shouldn't try qwen-code
-            except Exception as e:
-                reply = str(e)
-                continue
-                
-        if success:
-            self.chat_history.append({"role": "assistant", "content": reply})
-            
-            # Skip autonomous command execution when the response was for an
-            # image analysis request.  Qwen CLI's internal tool-use output
-            # (from reading image files via --yolo) may contain code-block
-            # artifacts that _run_autonomous_commands would try to execute,
-            # keeping the processing state alive and blocking app close.
-            if not image_paths and self._run_autonomous_commands(reply, False):
-                return
-            
-            GLib.idle_add(self.on_api_success, reply)
-        else:
-            if reply:
-                msg = f"CLI Error: {reply}"
-            else:
-                msg = "Could not find 'qwen' or 'qwen-code' binaries in PATH or `~/.npm-global/bin`.\nPlease click 'Install / Update Qwen CLI' in Settings."
-            GLib.idle_add(self.on_api_error, msg)
 
 
     def on_api_success(self, reply):
@@ -4189,8 +3641,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             win = _ActionProgressWindow(
                 parent=self.window if self.window else self.get_root(),
                 title=_("Downloading Neural TTS Engine/Voice"),
-                cmd_string=full_cmd,
-                poll_auth_file=False
+                cmd_string=full_cmd
             )
             def on_done(success):
                 if on_ready:
