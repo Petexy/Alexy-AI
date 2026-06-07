@@ -36,6 +36,48 @@ CONVERSATIONS_DIR = os.path.join(CONFIG_DIR, "conversations")
 BUNDLED_THEMES_DIR = "/usr/share/linexin/widgets/themes/"
 USER_THEMES_DIR = os.path.join(CONFIG_DIR, "themes")
 
+
+def _resolve_icon(*candidates: str) -> Optional[str]:
+    """Return the first icon name that actually exists in the current icon
+    theme. Returns None if none of the candidates are available.
+
+    Some desktops (notably KDE Plasma with the Breeze icon theme) do not ship
+    every GNOME/freedesktop symbolic icon name, e.g. ``list-add-symbolic``.
+    Probing the theme lets us fall back to a name that does exist instead of
+    rendering a blank/broken button.
+    """
+    try:
+        from gi.repository import Gdk  # type: ignore # pylint: disable=import-error
+        display = Gdk.Display.get_default()
+        if display is not None:
+            theme = Gtk.IconTheme.get_for_display(display)
+            for name in candidates:
+                if name and theme.has_icon(name):
+                    return name
+    except Exception:
+        pass
+    return None
+
+
+def _icon(primary: str, *fallbacks: str) -> str:
+    """Like :func:`_resolve_icon` but always returns a usable string, defaulting
+    to ``primary`` when nothing in the theme matched."""
+    return _resolve_icon(primary, *fallbacks) or primary
+
+
+def _set_button_icon(button, *candidates: str, text_fallback: Optional[str] = None) -> None:
+    """Set a button's icon to the first available candidate. If none of the
+    icon names exist in the theme and ``text_fallback`` is given, show that text
+    instead so the control is never invisible."""
+    name = _resolve_icon(*candidates)
+    if name:
+        button.set_icon_name(name)
+    elif text_fallback is not None:
+        button.set_label(text_fallback)
+    else:
+        button.set_icon_name(candidates[0])
+
+
 class SudoManager:
     _instance: Optional['SudoManager'] = None
     @classmethod
@@ -509,9 +551,18 @@ class MultilineEntry(Gtk.ScrolledWindow):
         self.textview.add_controller(key_ctrl)
 
 class LinexinAISysadminWidget(Gtk.Box):
+    # Class-level (display-shared) theme CSS provider. All widget instances
+    # share ONE provider so a stale provider from a previously-created instance
+    # can never linger on the display and keep applying an old theme's rules
+    # (e.g. switching Matrix -> Default left Matrix's border/background because a
+    # second instance still had a Matrix provider attached).
+    _shared_theme_provider: Optional[Gtk.CssProvider] = None
+
     def __init__(self, hide_sidebar=False, window=None, sudo_manager=None, voice_autostart=False, conversation_id=None, **kwargs):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12) # type: ignore
         self.widgetname = "Alexy AI"
+        # Scope tag so theme CSS only affects this widget, not the whole app.
+        self.add_css_class("alexy-ai-root")
         self.alexy_icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "icons", "github.petexy.alexy.svg")
         if not os.path.isfile(self.alexy_icon_path):
             self.alexy_icon_path = "/usr/share/icons/github.petexy.alexy.svg"
@@ -533,7 +584,7 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.arecord_proc: Optional[subprocess.Popen[bytes]] = None
         
         # Default config
-        self.backend = "local" # "direct" or "local"
+        self.backend = "local" # "direct", "local" or "endpoint"
         
         # Direct API Config
         self.api_key = ""
@@ -543,6 +594,10 @@ class LinexinAISysadminWidget(Gtk.Box):
         # Local AI Config
         self.local_model = "qwen3.5"
         self.local_url = "http://localhost:11434/api/chat"
+
+        # Local AI (custom OpenAI-compatible endpoint) Config
+        self.endpoint_url = "http://localhost:6767/v1"
+        self.endpoint_model = "local-model"
         
         # Voice-to-Text Config
         self.stt_backend = "whisper"  # "whisper" or "vosk"
@@ -780,7 +835,8 @@ class LinexinAISysadminWidget(Gtk.Box):
         all_conversations = self._list_conversations()
         backend_labels = {
             "direct": _("Online API"),
-            "local": _("Local AI")
+            "local": _("Local AI"),
+            "endpoint": _("Local AI (Endpoint)")
         }
         available_backends = set()
         for conv_id, title, updated in all_conversations:
@@ -821,7 +877,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             btn_group.add_css_class("linked")
 
             first_btn = None
-            backend_order = ["direct", "local"]
+            backend_order = ["direct", "local", "endpoint"]
             for backend_key in backend_order:
                 if backend_key not in available_backends:
                     continue
@@ -874,10 +930,13 @@ class LinexinAISysadminWidget(Gtk.Box):
                 row.set_subtitle(updated)
 
             if conv_id == self.current_conversation_id:
-                row.add_prefix(Gtk.Image.new_from_icon_name("emblem-ok-symbolic"))
+                row.add_prefix(Gtk.Image.new_from_icon_name(
+                    _icon("emblem-ok-symbolic", "emblem-ok", "object-select-symbolic", "object-select")))
 
             # Edit (rename) button
-            edit_btn = Gtk.Button(icon_name="document-edit-symbolic")
+            edit_btn = Gtk.Button()
+            _set_button_icon(edit_btn, "document-edit-symbolic", "document-edit",
+                             "edit-rename-symbolic", "edit-rename", text_fallback="\u270e")
             edit_btn.set_valign(Gtk.Align.CENTER)
             edit_btn.add_css_class("flat")
             edit_btn.set_focusable(False)
@@ -889,7 +948,9 @@ class LinexinAISysadminWidget(Gtk.Box):
                     edit_row.set_text(t)
                     edit_row.add_css_class("boxed-list")
 
-                    cancel_btn = Gtk.Button(icon_name="window-close-symbolic")
+                    cancel_btn = Gtk.Button()
+                    _set_button_icon(cancel_btn, "window-close-symbolic", "window-close",
+                                     "dialog-close", text_fallback="\u2715")
                     cancel_btn.set_valign(Gtk.Align.CENTER)
                     cancel_btn.add_css_class("flat")
 
@@ -917,7 +978,9 @@ class LinexinAISysadminWidget(Gtk.Box):
             row.add_suffix(edit_btn)
 
             # Delete button
-            delete_btn = Gtk.Button(icon_name="user-trash-symbolic")
+            delete_btn = Gtk.Button()
+            _set_button_icon(delete_btn, "user-trash-symbolic", "user-trash",
+                             "edit-delete-symbolic", "edit-delete", text_fallback="\U0001f5d1")
             delete_btn.set_valign(Gtk.Align.CENTER)
             delete_btn.add_css_class("flat")
             delete_btn.add_css_class("error")
@@ -1041,18 +1104,85 @@ class LinexinAISysadminWidget(Gtk.Box):
         from gi.repository import Gdk  # type: ignore
         display = Gdk.Display.get_default()
 
-        # Remove previously applied theme CSS
-        if self._theme_css_provider and display:
-            Gtk.StyleContext.remove_provider_for_display(display, self._theme_css_provider)
-            self._theme_css_provider = None
+        if display:
+            # Scope every rule under this widget's root class so the theme only
+            # styles the Alexy AI widget and never leaks into the rest of the
+            # Linexin Center app sharing the same display.
+            scoped_css = self._scope_css(css_text, ".alexy-ai-root")
+            # Use a SINGLE display-shared provider for ALL widget instances and
+            # just reload its data on each theme change. Reloading an attached
+            # provider fully replaces the previous CSS and reliably invalidates
+            # styles across the display. A class-level singleton also prevents a
+            # stale provider from a previously-created instance lingering on the
+            # display and keeping an old theme's rules applied (the cause of
+            # Matrix styling persisting after switching to Default).
+            cls = LinexinAISysadminWidget
+            if cls._shared_theme_provider is None:
+                cls._shared_theme_provider = Gtk.CssProvider()
+                Gtk.StyleContext.add_provider_for_display(
+                    display, cls._shared_theme_provider,
+                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1  # type: ignore
+                )
+            cls._shared_theme_provider.load_from_data(scoped_css.encode("utf-8"))
+            self._theme_css_provider = cls._shared_theme_provider
 
-        if css_text and display:
-            provider = Gtk.CssProvider()
-            provider.load_from_data(css_text.encode("utf-8"))
-            Gtk.StyleContext.add_provider_for_display(
-                display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1  # type: ignore
-            )
-            self._theme_css_provider = provider
+    def _scope_css(self, css_text: str, scope: str) -> str:
+        """Prefix every CSS selector with ``scope`` so the rules only apply to
+        widgets inside the scoped subtree.
+
+        This is a lightweight, brace-aware transformer (not a full CSS parser).
+        It handles comma-separated selectors and nested conditional at-rules
+        (@media/@supports/@container), and leaves other at-rules
+        (@keyframes/@font-face/@import/@define-color) untouched.
+        """
+        import re
+        # Strip comments to simplify parsing.
+        css_text = re.sub(r"/\*.*?\*/", "", css_text, flags=re.DOTALL)
+        result = []
+        pos = 0
+        length = len(css_text)
+        while pos < length:
+            brace = css_text.find("{", pos)
+            if brace == -1:
+                tail = css_text[pos:].strip()
+                if tail:
+                    result.append(tail)
+                break
+            selector = css_text[pos:brace]
+            # Find the matching closing brace, accounting for nesting.
+            depth = 1
+            j = brace + 1
+            while j < length and depth > 0:
+                if css_text[j] == "{":
+                    depth += 1
+                elif css_text[j] == "}":
+                    depth -= 1
+                j += 1
+            body = css_text[brace:j]  # includes the outer { ... }
+            sel = selector.strip()
+            if sel.startswith("@"):
+                keyword = sel.split()[0].lower() if sel else ""
+                if keyword in ("@media", "@supports", "@container"):
+                    inner = self._scope_css(body[1:-1], scope)
+                    result.append(f"{sel} {{{inner}}}")
+                else:
+                    # Non-conditional at-rules apply globally by design.
+                    result.append(sel + " " + body)
+            elif sel:
+                parts = [p.strip() for p in sel.split(",") if p.strip()]
+                scoped_parts = []
+                for p in parts:
+                    # Descendant form: matches widgets inside the root.
+                    variants = [f"{scope} {p}"]
+                    # Same-element form: lets selectors whose first compound is a
+                    # class/id/pseudo/attribute (e.g. ".dark ...", applied to the
+                    # root widget itself) keep matching after scoping.
+                    if p[:1] in ".#:[":
+                        variants.append(f"{scope}{p}")
+                    scoped_parts.extend(variants)
+                result.append(", ".join(scoped_parts) + " " + body)
+            pos = j
+        return "\n".join(result)
 
     def _get_theme_svg(self, filename: str) -> Optional[str]:
         """Return absolute path to a theme SVG file, or None if it doesn't exist."""
@@ -1076,6 +1206,8 @@ class LinexinAISysadminWidget(Gtk.Box):
                     self.api_url = config.get("api_url", self.api_url)
                     self.model = config.get("model", self.model)
                     self.local_model = config.get("local_model", self.local_model)
+                    self.endpoint_url = config.get("endpoint_url", self.endpoint_url)
+                    self.endpoint_model = config.get("endpoint_model", self.endpoint_model)
                     self.system_prompt = config.get("system_prompt", self.system_prompt)
                     self.stt_backend = config.get("stt_backend", "whisper")
                     self.whisper_model = config.get("whisper_model", "small")
@@ -1098,6 +1230,8 @@ class LinexinAISysadminWidget(Gtk.Box):
                     "api_url": self.api_url,
                     "model": self.model,
                     "local_model": self.local_model,
+                    "endpoint_url": self.endpoint_url,
+                    "endpoint_model": self.endpoint_model,
                     "system_prompt": self.system_prompt,
                     "stt_backend": self.stt_backend,
                     "whisper_model": self.whisper_model,
@@ -1116,10 +1250,9 @@ class LinexinAISysadminWidget(Gtk.Box):
         header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         header_box.set_margin_bottom(8)
         
-        header_svg = self._get_theme_svg("header-icon.svg")
-        if header_svg:
-            system_icon = Gtk.Image.new_from_file(header_svg)
-        elif os.path.isfile(self.alexy_icon_path):
+        # The Alexy AI icon is intentionally NOT themeable: it always shows the
+        # agent's own icon regardless of the selected theme.
+        if os.path.isfile(self.alexy_icon_path):
             system_icon = Gtk.Image.new_from_file(self.alexy_icon_path)
         else:
             system_icon = Gtk.Image.new_from_icon_name("system-run-symbolic")
@@ -1145,8 +1278,16 @@ class LinexinAISysadminWidget(Gtk.Box):
         
         header_box.append(title_box)
 
-        # New conversation button
-        self.new_conv_btn = Gtk.Button(icon_name="list-add-symbolic")
+        # New conversation button.
+        # NOTE: we deliberately render the "+" as a text label rather than the
+        # "list-add-symbolic" icon. Some icon themes (e.g. Tela, Breeze on KDE
+        # Plasma) ship a list-add-symbolic SVG that GTK4 fails to render
+        # (a <style>/transform combination that paints nothing), so the button
+        # appeared empty. A label is theme-independent and adapts to light/dark.
+        self.new_conv_btn = Gtk.Button()
+        _plus_label = Gtk.Label()
+        _plus_label.set_markup('<span size="x-large" weight="bold">+</span>')
+        self.new_conv_btn.set_child(_plus_label)
         self.new_conv_btn.set_valign(Gtk.Align.CENTER)
         self.new_conv_btn.add_css_class("circular")
         self.new_conv_btn.set_tooltip_text(_("Start a new conversation"))
@@ -1154,7 +1295,9 @@ class LinexinAISysadminWidget(Gtk.Box):
         header_box.append(self.new_conv_btn)
 
         # Conversations toggle button
-        self.conv_toggle_btn = Gtk.ToggleButton(icon_name="view-list-symbolic")
+        self.conv_toggle_btn = Gtk.ToggleButton()
+        _set_button_icon(self.conv_toggle_btn, "view-list-symbolic", "view-list",
+                         "view-list-details-symbolic", "view-list-details", text_fallback="\u2630")
         self.conv_toggle_btn.set_valign(Gtk.Align.CENTER)
         self.conv_toggle_btn.add_css_class("circular")
         self.conv_toggle_btn.set_tooltip_text(_("Browse saved conversations"))
@@ -1162,7 +1305,10 @@ class LinexinAISysadminWidget(Gtk.Box):
         header_box.append(self.conv_toggle_btn)
 
         # Settings button
-        self.settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
+        self.settings_btn = Gtk.Button()
+        _set_button_icon(self.settings_btn, "emblem-system-symbolic", "emblem-system",
+                         "preferences-system-symbolic", "preferences-system",
+                         "configure", text_fallback="\u2699")
         self.settings_btn.set_valign(Gtk.Align.CENTER)
         self.settings_btn.add_css_class("circular")
         self.settings_btn.connect("clicked", self.on_settings_clicked)
@@ -1256,7 +1402,11 @@ class LinexinAISysadminWidget(Gtk.Box):
         drop_target_texture.connect("drop", self._on_texture_drop)
         self.entry.add_controller(drop_target_texture)
 
-        self.send_btn = Gtk.Button(icon_name="mail-send-symbolic")
+        self._icon_send = _icon("mail-send-symbolic", "mail-send",
+                                "document-send-symbolic", "document-send", "go-next-symbolic")
+        self._icon_stop = _icon("media-playback-stop-symbolic", "media-playback-stop",
+                                "process-stop-symbolic", "process-stop")
+        self.send_btn = Gtk.Button(icon_name=self._icon_send)
         self.send_btn.add_css_class("suggested-action")
         self.send_btn.set_size_request(40, 40)
         self.send_btn.set_valign(Gtk.Align.END)
@@ -1264,7 +1414,8 @@ class LinexinAISysadminWidget(Gtk.Box):
         input_box.append(self.send_btn)
 
         self.stt_toggle = Gtk.ToggleButton()
-        self.stt_icon = Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic")
+        self.stt_icon = Gtk.Image.new_from_icon_name(
+            _icon("audio-input-microphone-symbolic", "audio-input-microphone"))
         self.stt_toggle.set_child(self.stt_icon)
         self.stt_toggle.set_size_request(40, 40)
         self.stt_toggle.set_valign(Gtk.Align.END)
@@ -1278,7 +1429,8 @@ class LinexinAISysadminWidget(Gtk.Box):
 
         # Screen Awareness toggle button
         self.screen_toggle = Gtk.ToggleButton()
-        self.screen_toggle_icon = Gtk.Image.new_from_icon_name("computer-symbolic")
+        self.screen_toggle_icon = Gtk.Image.new_from_icon_name(
+            _icon("computer-symbolic", "computer", "video-display-symbolic", "video-display"))
         self.screen_toggle.set_child(self.screen_toggle_icon)
         self.screen_toggle.set_size_request(40, 40)
         self.screen_toggle.set_valign(Gtk.Align.END)
@@ -1772,6 +1924,8 @@ class LinexinAISysadminWidget(Gtk.Box):
             self.subtitle_label.set_label(_("Online API: {}").format(self.model))
         elif self.backend == "local":
             self.subtitle_label.set_label(_("Local AI: {}").format(self.local_model))
+        elif self.backend == "endpoint":
+            self.subtitle_label.set_label(_("Local AI: {}").format(self.endpoint_model or _("auto-detected")))
 
     def add_message_bubble(self, role, content, is_html=False):
         row = Gtk.ListBoxRow()
@@ -1891,10 +2045,9 @@ class LinexinAISysadminWidget(Gtk.Box):
             box.append(bubble)
         else:
             box.set_halign(Gtk.Align.START)
-            avatar_svg = self._get_theme_svg("assistant-avatar.svg")
-            if avatar_svg:
-                icon = Gtk.Image.new_from_file(avatar_svg)
-            elif os.path.isfile(self.alexy_icon_path):
+            # The Alexy AI avatar is intentionally NOT themeable: it always
+            # shows the agent's own icon regardless of the selected theme.
+            if os.path.isfile(self.alexy_icon_path):
                 icon = Gtk.Image.new_from_file(self.alexy_icon_path)
             else:
                 icon = Gtk.Image.new_from_icon_name(self.widgeticon)
@@ -1963,12 +2116,15 @@ class LinexinAISysadminWidget(Gtk.Box):
         model = Gtk.StringList()
         model.append(_("Direct API (Online)"))
         model.append(_("Local AI (Ollama)"))
+        model.append(_("Local AI (Endpoint)"))
         backend_row.set_model(model)
         
         if self.backend == "direct":
             backend_row.set_selected(0)
         elif self.backend == "local":
             backend_row.set_selected(1)
+        elif self.backend == "endpoint":
+            backend_row.set_selected(2)
             
         general_group.add(backend_row)
 
@@ -1987,6 +2143,14 @@ class LinexinAISysadminWidget(Gtk.Box):
         model_entry = Adw.EntryRow(title=_("Model"))
         model_entry.set_text(self.model)
         direct_group.add(model_entry)
+
+        # Dynamic Local AI (custom endpoint) Group
+        endpoint_group = Adw.PreferencesGroup(title=_("Local AI (Endpoint)"), description=_("Connects to a local OpenAI-compatible server via its endpoint URL (e.g. http://localhost:6767/v1). The model is detected automatically — no API key, model name or Ollama required."))
+        page_llm.add(endpoint_group)
+
+        endpoint_url_entry = Adw.EntryRow(title=_("Endpoint URL"))
+        endpoint_url_entry.set_text(self.endpoint_url)
+        endpoint_group.add(endpoint_url_entry)
 
         # Dynamic Local AI Group
         local_group = Adw.PreferencesGroup(title=_("Local AI"), description=_("Uses Ollama daemon sequentially running on localhost:11434."))
@@ -2142,6 +2306,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             direct_group.set_visible(idx == 0)
             local_group.set_visible(idx == 1)
             pull_group.set_visible(idx == 1)
+            endpoint_group.set_visible(idx == 2)
 
         backend_row.connect("notify::selected", sync_backend_visibility)
         sync_backend_visibility() # apply initial state
@@ -2390,6 +2555,8 @@ class LinexinAISysadminWidget(Gtk.Box):
                 self.backend = "direct"
             elif idx == 1:
                 self.backend = "local"
+            elif idx == 2:
+                self.backend = "endpoint"
             
             if old_backend != self.backend:
                 new_backend = self.backend
@@ -2407,6 +2574,12 @@ class LinexinAISysadminWidget(Gtk.Box):
             self.api_key = api_key_entry.get_text()
             self.api_url = api_url_entry.get_text()
             self.model = model_entry.get_text()
+            new_endpoint_url = endpoint_url_entry.get_text().strip()
+            if new_endpoint_url and new_endpoint_url != self.endpoint_url:
+                # URL changed: drop the cached auto-detected model so it is
+                # re-discovered from the new server on the next request.
+                self.endpoint_url = new_endpoint_url
+                self.endpoint_model = ""
             
             if len(self.dynamic_models) > 0 and local_model_row.get_selected() < len(self.dynamic_models):
                 selected_dynamic = self.dynamic_models[local_model_row.get_selected()]
@@ -2646,7 +2819,7 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.spinner.stop()
         self.spinner.set_visible(False)
         self.entry.set_sensitive(True)
-        self.send_btn.set_icon_name("mail-send-symbolic")
+        self.send_btn.set_icon_name(self._icon_send)
         self.stt_toggle.set_sensitive(True)
         self.new_conv_btn.set_sensitive(True)
         self.conv_toggle_btn.set_sensitive(True)
@@ -2665,7 +2838,7 @@ class LinexinAISysadminWidget(Gtk.Box):
                     pass
             self._tts_proc = None
         self.tts_playing = False
-        self.send_btn.set_icon_name("mail-send-symbolic")
+        self.send_btn.set_icon_name(self._icon_send)
         self.stt_toggle.set_sensitive(True)
         self.new_conv_btn.set_sensitive(True)
         self.conv_toggle_btn.set_sensitive(True)
@@ -2989,7 +3162,9 @@ class LinexinAISysadminWidget(Gtk.Box):
             frame.set_size_request(60, 60)
             overlay.set_child(frame)
 
-            close_btn = Gtk.Button(icon_name="window-close-symbolic")
+            close_btn = Gtk.Button()
+            _set_button_icon(close_btn, "window-close-symbolic", "window-close",
+                             "dialog-close", text_fallback="✕")
             close_btn.add_css_class("circular")
             close_btn.add_css_class("osd")
             close_btn.set_halign(Gtk.Align.END)
@@ -3083,7 +3258,7 @@ class LinexinAISysadminWidget(Gtk.Box):
 
         self.entry.set_text("")
         self.entry.set_sensitive(False)
-        self.send_btn.set_icon_name("media-playback-stop-symbolic")
+        self.send_btn.set_icon_name(self._icon_stop)
         self.stt_toggle.set_sensitive(False)
         self.new_conv_btn.set_sensitive(False)
         self.conv_toggle_btn.set_sensitive(False)
@@ -3216,6 +3391,8 @@ class LinexinAISysadminWidget(Gtk.Box):
             self.call_direct_api()
         elif self.backend == "local":
             self.call_local_ollama()
+        elif self.backend == "endpoint":
+            self.call_endpoint_api()
 
     def call_direct_api(self):
         # Ensure the URL ends with /chat/completions
@@ -3233,6 +3410,77 @@ class LinexinAISysadminWidget(Gtk.Box):
         })
 
         self._execute_urllib_request(req)
+
+    def call_endpoint_api(self):
+        """Call a local OpenAI-compatible server using its endpoint URL.
+
+        Unlike the Direct API backend this does not send an Authorization
+        header, since local servers (llama.cpp, LM Studio, vLLM, etc.) usually
+        run without authentication. The model is auto-detected from the
+        server's /models listing, so the user never has to type a model name.
+        """
+        if not self.endpoint_url:
+            GLib.idle_add(self.on_api_error, _("No endpoint URL configured. Please open settings and set the Endpoint URL."))
+            return
+
+        # Auto-detect the model from the server if we don't have one cached.
+        if not self.endpoint_model:
+            detected = self._discover_endpoint_model()
+            if detected:
+                self.endpoint_model = detected
+                GLib.idle_add(self.update_subtitle)
+
+        # Build the chat completions URL from the normalized base.
+        url = self._endpoint_base_url() + "/chat/completions"
+
+        data = {
+            "model": self.endpoint_model or "local-model",
+            "messages": self.chat_history
+        }
+        req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers={
+            "Content-Type": "application/json"
+        })
+
+        self._execute_urllib_request(req)
+
+    def _endpoint_base_url(self):
+        """Return the normalized OpenAI-compatible base URL.
+
+        Strips any trailing /chat/completions and ensures the path ends with the
+        standard /v1 segment, which servers like LM Studio, llama.cpp and vLLM
+        require. This lets the user enter either "http://127.0.0.1:1234" or
+        "http://127.0.0.1:1234/v1" and have it work either way.
+        """
+        base = (self.endpoint_url or "").strip().rstrip("/")
+        if base.endswith("/chat/completions"):
+            base = base[: -len("/chat/completions")]
+        base = base.rstrip("/")
+        # Add the /v1 segment if the user didn't already include it.
+        if base and not (base.endswith("/v1") or "/v1/" in base):
+            base = base + "/v1"
+        return base
+
+    def _discover_endpoint_model(self):
+        """Query the endpoint's OpenAI-compatible /models listing and return the
+        first available model id, or None on failure."""
+        models_url = self._endpoint_base_url() + "/models"
+        try:
+            req = urllib.request.Request(models_url, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as response:
+                payload = json.loads(response.read().decode('utf-8'))
+            items = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(items, list) and items:
+                first = items[0]
+                if isinstance(first, dict):
+                    model_id = first.get("id") or first.get("name")
+                    if model_id:
+                        print(f"[Endpoint] Auto-detected model: {model_id}")
+                        return model_id
+        except Exception as e:
+            print(f"[Endpoint] Model auto-detection failed: {e}")
+        return None
+
+
 
     def call_local_ollama(self):
         if not self.is_ollama_installed():
@@ -3289,13 +3537,30 @@ class LinexinAISysadminWidget(Gtk.Box):
 
     def _execute_urllib_request(self, req, is_ollama=False):
         try:
-            with urllib.request.urlopen(req) as response:
+            # A generous timeout acts as a safety net against an unresponsive
+            # server hanging the worker thread forever, while still allowing
+            # slow local models enough time to generate a full response.
+            with urllib.request.urlopen(req, timeout=600) as response:
                 result = json.loads(response.read().decode('utf-8'))
                 if is_ollama:
                     reply = result.get('message', {}).get('content', '')
                 else:
-                    reply = result['choices'][0]['message']['content']
+                    try:
+                        reply = result['choices'][0]['message']['content']
+                    except (KeyError, IndexError, TypeError):
+                        # Surface server-side error payloads (common with local
+                        # OpenAI-compatible endpoints) instead of a cryptic crash.
+                        err = result.get('error') if isinstance(result, dict) else None
+                        if isinstance(err, dict):
+                            err = err.get('message', err)
+                        GLib.idle_add(self.on_api_error, _("Unexpected response from server: {}").format(err or result))
+                        return
                 
+                # Trim surrounding whitespace/newlines: some models (notably
+                # local OpenAI-compatible servers) prefix replies with blank
+                # lines, which would otherwise push the text down in the bubble.
+                reply = (reply or "").strip()
+
                 self.chat_history.append({"role": "assistant", "content": reply})
                 
                 # Check for autonomous command execution securely via helper method
@@ -3496,6 +3761,8 @@ class LinexinAISysadminWidget(Gtk.Box):
             # Re-fire API recursively in the background thread
             if self.backend == 'local':
                 self.call_local_ollama() # type: ignore
+            elif self.backend == 'endpoint':
+                self.call_endpoint_api() # type: ignore
             else:
                 self.call_direct_api() # type: ignore
         return True
@@ -3509,7 +3776,7 @@ class LinexinAISysadminWidget(Gtk.Box):
         def _unlock_input():
             self.llm_processing = False
             self.entry.set_sensitive(True)
-            self.send_btn.set_icon_name("mail-send-symbolic")
+            self.send_btn.set_icon_name(self._icon_send)
             self.stt_toggle.set_sensitive(True)
             self.new_conv_btn.set_sensitive(True)
             self.conv_toggle_btn.set_sensitive(True)
@@ -3589,7 +3856,7 @@ class LinexinAISysadminWidget(Gtk.Box):
                 print(f"Executing fallback TTS (espeak-ng): -v {model_path}")
                 self._tts_proc = subprocess.Popen(["espeak-ng", "-v", model_path, clean_text], preexec_fn=os.setsid)
                 self.tts_playing = True
-                self.send_btn.set_icon_name("media-playback-stop-symbolic")
+                self.send_btn.set_icon_name(self._icon_stop)
                 self.stt_toggle.set_sensitive(False)
                 if on_ready:
                     GLib.idle_add(on_ready)
@@ -3612,7 +3879,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             print(f"Executing TTS: {cmd}")
             self._tts_proc = subprocess.Popen(["bash", "-c", cmd], preexec_fn=os.setsid)
             self.tts_playing = True
-            self.send_btn.set_icon_name("media-playback-stop-symbolic")
+            self.send_btn.set_icon_name(self._icon_stop)
             self.stt_toggle.set_sensitive(False)
             # Wait for piper to finish, then reset state
             def watch_piper():
@@ -3665,7 +3932,7 @@ class LinexinAISysadminWidget(Gtk.Box):
         if len(self.chat_history) > 1:
             self.chat_history.pop() # remove failed prompt from history
         self.entry.set_sensitive(True)
-        self.send_btn.set_icon_name("mail-send-symbolic")
+        self.send_btn.set_icon_name(self._icon_send)
         self.stt_toggle.set_sensitive(True)
         self.new_conv_btn.set_sensitive(True)
         self.conv_toggle_btn.set_sensitive(True)
@@ -3786,7 +4053,9 @@ class CompactVoiceWindow(Adw.Window):
         bar.set_margin_end(6)
 
         # Close button
-        close_btn = Gtk.Button(icon_name="window-close-symbolic")
+        close_btn = Gtk.Button()
+        _set_button_icon(close_btn, "window-close-symbolic", "window-close",
+                         "dialog-close", text_fallback="✕")
         close_btn.add_css_class("flat")
         close_btn.set_tooltip_text(_("Close"))
         close_btn.connect("clicked", self._on_close_clicked)
@@ -3794,7 +4063,8 @@ class CompactVoiceWindow(Adw.Window):
 
         # Microphone toggle
         self._mic_btn = Gtk.ToggleButton()
-        mic_icon = Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic")
+        mic_icon = Gtk.Image.new_from_icon_name(
+            _icon("audio-input-microphone-symbolic", "audio-input-microphone"))
         # Try loading themed mic icon
         theme_mic = self._ai_widget._get_theme_svg("microphone-icon.svg")
         if theme_mic:
@@ -3806,14 +4076,19 @@ class CompactVoiceWindow(Adw.Window):
         bar.append(self._mic_btn)
 
         # Settings button
-        settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
+        settings_btn = Gtk.Button()
+        _set_button_icon(settings_btn, "emblem-system-symbolic", "emblem-system",
+                         "preferences-system-symbolic", "preferences-system",
+                         "configure", text_fallback="⚙")
         settings_btn.add_css_class("flat")
         settings_btn.set_tooltip_text(_("Settings"))
         settings_btn.connect("clicked", self._on_settings_clicked)
         bar.append(settings_btn)
 
         # Expand chat button
-        expand_btn = Gtk.Button(icon_name="view-fullscreen-symbolic")
+        expand_btn = Gtk.Button()
+        _set_button_icon(expand_btn, "view-fullscreen-symbolic", "view-fullscreen",
+                         "view-restore-symbolic", "view-restore", text_fallback="⛶")
         expand_btn.add_css_class("flat")
         expand_btn.set_tooltip_text(_("Expand chat"))
         expand_btn.connect("clicked", self._on_expand_clicked)

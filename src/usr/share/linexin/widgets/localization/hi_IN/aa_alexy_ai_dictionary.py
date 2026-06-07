@@ -173,4 +173,10 @@ translations = {
     'Uninstall Ollama': 'Ollama अनइंस्टॉल करें',
     'Uninstalling Ollama': 'Ollama अनइंस्टॉल हो रहा है',
     'Waiting for authorization to complete...': 'प्राधिकरण पूरा होने की प्रतीक्षा हो रही है...',
+    'Connects to a local OpenAI-compatible server via its endpoint URL (e.g. http://localhost:6767/v1). The model is detected automatically — no API key, model name or Ollama required.': 'अपने एंडपॉइंट URL (जैसे http://localhost:6767/v1) के माध्यम से एक स्थानीय OpenAI-संगत सर्वर से जुड़ता है। मॉडल का स्वचालित रूप से पता लगाया जाता है — किसी API कुंजी, मॉडल नाम या Ollama की आवश्यकता नहीं।',
+    'Endpoint URL': 'एंडपॉइंट URL',
+    'Local AI (Endpoint)': 'स्थानीय AI (एंडपॉइंट)',
+    'No endpoint URL configured. Please open settings and set the Endpoint URL.': 'कोई एंडपॉइंट URL कॉन्फ़िगर नहीं किया गया। कृपया सेटिंग्स खोलें और एंडपॉइंट URL सेट करें।',
+    'Unexpected response from server: {}': 'सर्वर से अप्रत्याशित प्रतिक्रिया: {}',
+    'auto-detected': 'स्वतः पता लगाया गया',
 }

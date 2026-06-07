@@ -173,4 +173,10 @@ translations = {
     'Uninstall Ollama': 'Odinstaluj Ollama',
     'Uninstalling Ollama': 'Odinstalowanie Ollama',
     'Waiting for authorization to complete...': 'Oczekiwanie na zakończenie autoryzacji...',
+    'Connects to a local OpenAI-compatible server via its endpoint URL (e.g. http://localhost:6767/v1). The model is detected automatically — no API key, model name or Ollama required.': 'Łączy się z lokalnym serwerem zgodnym z OpenAI poprzez jego adres URL punktu końcowego (np. http://localhost:6767/v1). Model jest wykrywany automatycznie — nie jest wymagany klucz API, nazwa modelu ani Ollama.',
+    'Endpoint URL': 'Adres URL punktu końcowego',
+    'Local AI (Endpoint)': 'Lokalna AI (punkt końcowy)',
+    'No endpoint URL configured. Please open settings and set the Endpoint URL.': 'Nie skonfigurowano adresu URL punktu końcowego. Otwórz ustawienia i ustaw adres URL punktu końcowego.',
+    'Unexpected response from server: {}': 'Nieoczekiwana odpowiedź z serwera: {}',
+    'auto-detected': 'wykryto automatycznie',
 }

@@ -173,4 +173,10 @@ translations = {
     'Uninstall Ollama': '卸载 Ollama',
     'Uninstalling Ollama': '正在卸载 Ollama',
     'Waiting for authorization to complete...': '正在等待授权完成...',
+    'Connects to a local OpenAI-compatible server via its endpoint URL (e.g. http://localhost:6767/v1). The model is detected automatically — no API key, model name or Ollama required.': '通过其端点 URL（例如 http://localhost:6767/v1）连接到本地 OpenAI 兼容服务器。模型会自动检测——无需 API 密钥、模型名称或 Ollama。',
+    'Endpoint URL': '端点 URL',
+    'Local AI (Endpoint)': '本地 AI（端点）',
+    'No endpoint URL configured. Please open settings and set the Endpoint URL.': '未配置端点 URL。请打开设置并设置端点 URL。',
+    'Unexpected response from server: {}': '来自服务器的意外响应：{}',
+    'auto-detected': '自动检测',
 }

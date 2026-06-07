@@ -173,4 +173,10 @@ translations = {
     'Uninstall Ollama': 'Desinstalar Ollama',
     'Uninstalling Ollama': 'Desinstalando Ollama',
     'Waiting for authorization to complete...': 'Esperando a que se complete la autorización...',
+    'Connects to a local OpenAI-compatible server via its endpoint URL (e.g. http://localhost:6767/v1). The model is detected automatically — no API key, model name or Ollama required.': 'Se conecta a un servidor local compatible con OpenAI a través de su URL de endpoint (p. ej. http://localhost:6767/v1). El modelo se detecta automáticamente: no se requiere clave API, nombre de modelo ni Ollama.',
+    'Endpoint URL': 'URL del endpoint',
+    'Local AI (Endpoint)': 'IA local (endpoint)',
+    'No endpoint URL configured. Please open settings and set the Endpoint URL.': 'No hay ninguna URL de endpoint configurada. Abre la configuración y establece la URL del endpoint.',
+    'Unexpected response from server: {}': 'Respuesta inesperada del servidor: {}',
+    'auto-detected': 'detectado automáticamente',
 }

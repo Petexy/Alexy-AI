@@ -1,0 +1,207 @@
+/* Matrix Theme CSS
+ *
+ * Glowing green text on black with a pixelated terminal font.
+ * The font-family list tries several common pixel/bitmap fonts and falls
+ * back to a generic monospace if none are installed on the system.
+ *
+ * NOTE: selectors here are written WITHOUT a widget-scope prefix on purpose.
+ * The widget automatically scopes every rule to the Alexy AI widget, so these
+ * styles never leak into the rest of the Linexin Center app.
+ */
+
+/* Pixelated / terminal font applied to everything in the widget */
+* {
+    font-family: "Perfect DOS VGA 437", "Px437 IBM VGA 8x16", "PxPlus IBM VGA 8x16",
+                 "Terminus", "TerminessTTF Nerd Font", "Monocraft", "Minecraft",
+                 "Fixedsys Excelsior", "DejaVu Sans Mono", monospace;
+}
+
+/* ---- Black background for the whole widget ----
+ * The root carries the .alexy-ai-root class (matched via the same-element
+ * scoped variant). Containers are made transparent so the black shows through.
+ * A glowing green border + inner padding frame the widget like a terminal.
+ */
+.alexy-ai-root {
+    background-color: #000000;
+    border: 2px solid #00ff41;
+    border-radius: 4px;
+    padding: 12px;
+    box-shadow: inset 0 0 12px rgba(0, 255, 65, 0.25);
+}
+
+stack,
+box,
+viewport,
+scrolledwindow,
+list,
+row {
+    background-color: transparent;
+    border: none;
+}
+
+row.message-row {
+    margin-top: 4px;
+    margin-bottom: 4px;
+    margin-left: 12px;
+    margin-right: 12px;
+}
+
+/* Titles and generic labels glow green */
+.title-1,
+.title-4,
+label {
+    color: #00ff41;
+    text-shadow: 0 0 6px rgba(0, 255, 65, 0.6);
+}
+
+.dim-label {
+    color: #00b32d;
+}
+
+/* ---- Buttons (new conversation, settings, mic, screen awareness, etc.) ---- */
+button,
+togglebutton {
+    background-color: #001a05;
+    background-image: none;
+    color: #00ff41;
+    border: 1px solid #00ff41;
+    border-radius: 2px;
+    text-shadow: 0 0 6px rgba(0, 255, 65, 0.6);
+    box-shadow: none;
+}
+
+/* Symbolic icons inside buttons inherit this color */
+button image,
+togglebutton image {
+    color: #00ff41;
+}
+
+button:hover,
+togglebutton:hover {
+    background-color: #00591a;
+    border-color: #39ff14;
+    color: #aaffaa;
+}
+
+button:active,
+togglebutton:active,
+togglebutton:checked {
+    background-color: #00591a;
+    border-color: #39ff14;
+    color: #ffffff;
+}
+
+button:disabled,
+togglebutton:disabled {
+    background-color: #000000;
+    color: #006618;
+    border-color: #006618;
+    text-shadow: none;
+}
+
+/* Keep circular header buttons squared-off for the terminal look */
+button.circular,
+togglebutton.circular {
+    border-radius: 2px;
+}
+
+/* The "send" button keeps a slightly brighter accent */
+button.suggested-action {
+    background-color: #003b10;
+    color: #00ff41;
+    border: 1px solid #00ff41;
+    border-radius: 2px;
+}
+
+button.suggested-action:hover {
+    background-color: #00591a;
+}
+
+/* Destructive (e.g. delete conversation) stays in palette but tinted red-green */
+button.destructive-action {
+    background-color: #1a0500;
+    color: #ff5555;
+    border: 1px solid #ff5555;
+}
+
+/* ---- Assistant bubble: dark panel with green border ---- */
+box.assistant-bubble {
+    background-color: #001a05;
+    color: #00ff41;
+    border: 1px solid #00ff41;
+    border-radius: 2px;
+    padding: 8px 14px;
+    margin-right: 60px;
+}
+
+box.assistant-bubble label {
+    color: #00ff41;
+    text-shadow: 0 0 6px rgba(0, 255, 65, 0.6);
+}
+
+/* ---- User bubble: brighter green frame ---- */
+box.user-bubble {
+    background-color: #002b08;
+    color: #aaffaa;
+    border: 1px solid #39ff14;
+    border-radius: 2px;
+    padding: 8px 14px;
+    margin-left: 60px;
+}
+
+box.user-bubble label {
+    color: #aaffaa;
+    text-shadow: 0 0 6px rgba(57, 255, 20, 0.6);
+}
+
+/* Squared-off "terminal" corners for grouped messages */
+box.user-message-box.last-in-group box.user-bubble,
+box.assistant-message-box.last-in-group box.assistant-bubble {
+    border-radius: 2px;
+}
+
+/* ---- Conversation list rows ---- */
+list.boxed-list,
+list.boxed-list row {
+    background-color: #000800;
+    border: 1px solid #00661a;
+    border-radius: 2px;
+    color: #00ff41;
+}
+
+list.boxed-list row:hover {
+    background-color: #00220a;
+}
+
+/* Thinking indicator pill */
+box.thinking-bubble {
+    padding: 6px 10px;
+    margin-right: 0;
+    margin-left: 0;
+    color: #00ff41;
+}
+
+/* ---- Input field ---- */
+.multiline-entry,
+entry,
+textview,
+textview text,
+text {
+    background-color: #000000;
+    color: #00ff41;
+    caret-color: #00ff41;
+    border: 1px solid #00ff41;
+    border-radius: 2px;
+}
+
+/* Buttons */
+button.suggested-action {
+    background-color: #003b10;
+    color: #00ff41;
+    border: 1px solid #00ff41;
+    border-radius: 2px;
+}
+
+button.suggested-action:hover {
+    background-color: #00591a;
+}
