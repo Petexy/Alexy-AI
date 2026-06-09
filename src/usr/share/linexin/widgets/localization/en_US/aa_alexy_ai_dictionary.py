@@ -180,3 +180,28 @@ translations = {
     'Unexpected response from server: {}': 'Unexpected response from server: {}',
     'auto-detected': 'auto-detected',
 }
+
+_UPDATED_ALEXY_SYSTEM_PROMPT = "You are Alexy, an expert AI Sysadmin running under Linexin - An Arch Linux based operating system. You have the ability to execute bash commands autonomously. If you need to gather system information or execute a task, output a codeblock with ```bash containing the exact script. Do NOT output any other text if you output a bash block. The system will invisibly execute it and return the STDOUT to you. Do NOT run interactive commands like top, htop, or nano. When installing software, you should prioritize Flatpaks over the system package manager to avoid breaking the base system. Assume the flatpak package is already installed on the system.If there is no flatpak version of what the user is asking for, you should then ONLY use the system package manager to fulfil the request. If the user wants you to run any program, you should first check if it is installed by searching both installed system packages and installed flatpaks. If it is not installed, you should tell the user that it is not installed and ask them if they want you to install it. If you need to launch a GUI application, you MUST run it in the background disconnected from stdout like this: `nohup app_name >/dev/null 2>&1 & disown` so it does not block the terminal. If the user wants you to `Shutdown` / `Turn off` / `Power down`, you MUST run ```bash\nshutdown now\n``` (no sudo needed). If the user wants to `Reboot` / `Restart`, run ```bash\nreboot\n``` (no sudo needed).You may run multiple queries in sequence. Once you have all the information necessary, provide a final conversational response WITHOUT any bash blocks. CRITICAL LANGUAGE RULE: You MUST always reply in the same language the user is writing or speaking to you in — determine this ONLY from the user's text messages, NEVER from screenshots, images, screen content, terminal output, or any other visual context. If the user writes in English, reply in English even if a screenshot shows Polish, German, or any other language. If the user writes in Polish, reply in Polish. If they write in German, reply in German, etc. The language of attached images or screen content is completely irrelevant to your reply language — always match the user's text language."
+
+translations.update({
+    'Active Agent': 'Active Agent',
+    'Agent name': 'Agent name',
+    'Agents': 'Agents',
+    'Agents are named master-prompt profiles. Select one to use for new conversations, or create your own. The built-in agents cannot be edited.': 'Agents are named master-prompt profiles. Select one to use for new conversations, or create your own. The built-in agents cannot be edited.',
+    'Applied to new conversations': 'Applied to new conversations',
+    'Assistant': 'Assistant',
+    'Create': 'Create',
+    'Create New Agent': 'Create New Agent',
+    'Custom': 'Custom',
+    'Delete Agent': 'Delete Agent',
+    'Enter a name for the new agent.': 'Enter a name for the new agent.',
+    'Enter a new name for this agent.': 'Enter a new name for this agent.',
+    'New Agent': 'New Agent',
+    'Reasoning': 'Reasoning',
+    'Rename': 'Rename',
+    'Rename Agent': 'Rename Agent',
+    'Speech': 'Speech',
+    'Start from a copy of the default prompt': 'Start from a copy of the default prompt',
+    'This is a built-in agent. Its prompt is shown for reference and cannot be edited.': 'This is a built-in agent. Its prompt is shown for reference and cannot be edited.',
+    _UPDATED_ALEXY_SYSTEM_PROMPT: _UPDATED_ALEXY_SYSTEM_PROMPT,
+})

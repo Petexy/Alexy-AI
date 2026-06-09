@@ -3,6 +3,7 @@ import gi # type: ignore # pylint: disable=import-error
 import os
 import json
 import re as _re
+import shutil
 import urllib.request
 import urllib.error
 import threading
@@ -30,11 +31,91 @@ try:
 except Exception:
     def _(message: str) -> str: return message
 
-CONFIG_DIR = os.path.expanduser("~/.config/linexin-center")
+CONFIG_DIR = os.path.expanduser("~/.config/linexin")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "ai-sysadmin.json")
 CONVERSATIONS_DIR = os.path.join(CONFIG_DIR, "conversations")
 BUNDLED_THEMES_DIR = "/usr/share/linexin/widgets/themes/"
 USER_THEMES_DIR = os.path.join(CONFIG_DIR, "themes")
+
+# Previous location of Alexy's settings (shared with the linexin-center dir).
+# On first launch after the move, the Alexy-specific files below are migrated
+# from here into CONFIG_DIR.
+_OLD_CONFIG_DIR = os.path.expanduser("~/.config/linexin-center")
+
+# Name of the built-in, non-editable agent (proper noun, kept as a stable key).
+DEFAULT_AGENT_NAME = "Alexy"
+
+# Additional built-in, non-editable agent that answers in rhyming verse.
+RHYMEXY_AGENT_NAME = "Rhymexy"
+RHYMEXY_PROMPT = """You are Rhymexy.
+
+Your purpose is to answer every user request in rhyming verse.
+
+Rules:
+
+1. Every response must rhyme.
+2. Always rhyme in the same language the user is writing in. Detect the user's language from their message and compose your rhymes in that language, never defaulting to English unless the user writes in English.
+3. Preserve factual accuracy.
+4. Never sacrifice correctness solely for rhyme.
+5. Use couplets, quatrains, or longer rhyme schemes as needed.
+6. Maintain a natural flow and readability.
+7. Never explain your rhyming behavior unless explicitly asked.
+8. For technical topics:
+ - Explain concepts using rhyme.
+ - Use precise terminology even if some lines do not rhyme perfectly.
+9. For code requests:
+ - Introduce the solution with rhyming text.
+ - Output code exactly as needed in code blocks.
+ - Resume rhyming after the code block if additional explanation is required.
+10. For refusals:
+ - Refuse while maintaining rhyme.
+ - Never abandon the rhyme scheme.
+
+Example:
+
+To sort this list with speed and grace,
+Use quicksort in the proper place.
+Its average runtime shines quite bright,
+Though worst-case paths may lose the fight.
+
+You are not occasionally poetic.
+You are permanently rhyming."""
+
+# Ordered list of built-in agent names (non-editable, baked into the app).
+BUILTIN_AGENT_NAMES = [DEFAULT_AGENT_NAME, RHYMEXY_AGENT_NAME]
+
+
+def _migrate_legacy_config() -> None:
+    """One-time migration of Alexy's settings from ~/.config/linexin-center to
+    ~/.config/linexin. Only the Alexy-specific items are moved; linexin-center's
+    own files are left untouched. Runs only if the new config does not yet exist."""
+    try:
+        if os.path.exists(CONFIG_FILE):
+            return  # Already migrated (or fresh install with new layout).
+        if not os.path.isdir(_OLD_CONFIG_DIR):
+            return  # Nothing to migrate.
+        items = ["ai-sysadmin.json", "conversations", "themes"]
+        moved_any = False
+        for name in items:
+            src = os.path.join(_OLD_CONFIG_DIR, name)
+            if not os.path.exists(src):
+                continue
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            dst = os.path.join(CONFIG_DIR, name)
+            if os.path.exists(dst):
+                continue  # Don't clobber anything already at the destination.
+            try:
+                shutil.move(src, dst)
+                moved_any = True
+            except Exception as e:
+                print(f"Config migration: failed to move {name}: {e}")
+        if moved_any:
+            print(f"Migrated Alexy settings to {CONFIG_DIR}")
+    except Exception as e:
+        print(f"Config migration error: {e}")
+
+
+_migrate_legacy_config()
 
 
 def _resolve_icon(*candidates: str) -> Optional[str]:
@@ -638,11 +719,25 @@ class LinexinAISysadminWidget(Gtk.Box):
             "If the user writes in Polish, reply in Polish. If they write in German, reply in German, etc. "
             "The language of attached images or screen content is completely irrelevant to your reply language — always match the user's text language."
         )
+        # Keep an immutable copy of the built-in master prompt so the user can
+        # revert their customized prompt back to the default at any time.
+        self._default_system_prompt = self.system_prompt
+        # Agents: named master-prompt profiles. The built-in "Alexy" agent uses
+        # the default prompt and is non-editable; the user can create custom
+        # agents with their own prompts. Only custom agents are persisted here.
+        self.user_agents: List[Dict[str, str]] = []
+        self.active_agent = DEFAULT_AGENT_NAME
         self.chat_history = []
+        # Streaming response context (set while an assistant reply streams in).
+        self._stream_ctx = None
+        self._stream_tick_id = None
         self.current_conversation_id = str(uuid.uuid4())
         self._reset_history()
         
         self.load_config()
+        # load_config may have changed the active agent's prompt; rebuild the
+        # initial (empty) history so a fresh conversation uses it.
+        self._reset_history()
         self._load_theme()
 
         # Flush pending GTK events so the loading spinner keeps animating
@@ -667,6 +762,28 @@ class LinexinAISysadminWidget(Gtk.Box):
 
     def _reset_history(self):
         self.chat_history = [{"role": "system", "content": self.system_prompt}]
+        # Remember which agent this fresh conversation belongs to.
+        self._conv_agent = self.active_agent
+
+    def _agent_names(self):
+        """Ordered list of all agent names: built-in agents first, then custom."""
+        return list(BUILTIN_AGENT_NAMES) + [a.get("name", "") for a in self.user_agents]
+
+    def _agent_prompt(self, name):
+        """Return the master prompt for the named agent (built-in prompt for
+        built-in agents, default for unknown names)."""
+        if name == DEFAULT_AGENT_NAME:
+            return self._default_system_prompt
+        if name == RHYMEXY_AGENT_NAME:
+            return RHYMEXY_PROMPT
+        for a in self.user_agents:
+            if a.get("name") == name:
+                return a.get("prompt", self._default_system_prompt)
+        return self._default_system_prompt
+
+    def _apply_active_agent(self):
+        """Sync self.system_prompt to the active agent's prompt."""
+        self.system_prompt = self._agent_prompt(self.active_agent)
 
     def _clear_chat_ui(self):
         """Remove all message bubbles from the chat listbox."""
@@ -707,6 +824,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             "created": getattr(self, '_conv_created', datetime.now().isoformat()),
             "updated": datetime.now().isoformat(),
             "backend": self.backend,
+            "agent": getattr(self, '_conv_agent', self.active_agent),
             "chat_history": self.chat_history
         }
         if not hasattr(self, '_conv_created'):
@@ -734,6 +852,8 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.current_conversation_id = conv_data["id"]
         self.chat_history = conv_data["chat_history"]
         self._conv_created = conv_data.get("created", "")
+        # Remember the agent this conversation was created with (for re-saving).
+        self._conv_agent = conv_data.get("agent", DEFAULT_AGENT_NAME)
         # Restore the backend the conversation was created with
         saved_backend = conv_data.get("backend", self.backend)
         # Migrate removed qwen_cli backend to direct
@@ -760,8 +880,9 @@ class LinexinAISysadminWidget(Gtk.Box):
                 self.add_message_bubble("assistant", msg["content"])
 
     def _list_conversations(self, backend_filter=None):
-        """Return a list of (id, title, updated) sorted by most recently updated.
-        If backend_filter is given, only return conversations for that backend."""
+        """Return a list of (id, title, updated, agent) sorted by agent then by
+        most recently updated. If backend_filter is given, only return
+        conversations for that backend."""
         conv_dir = self._get_conversations_dir()
         conversations = []
         for filename in os.listdir(conv_dir):
@@ -781,11 +902,21 @@ class LinexinAISysadminWidget(Gtk.Box):
                 conversations.append((
                     data.get("id", filename.replace(".json", "")),
                     data.get("title", _("Untitled")),
-                    data.get("updated", "")
+                    data.get("updated", ""),
+                    data.get("agent", DEFAULT_AGENT_NAME)
                 ))
             except Exception:
                 continue
+        # Group by agent (built-in agents first in their fixed order, then
+        # custom agents alphabetically), most recent conversation first within
+        # each agent group.
+        def _agent_sort_key(x):
+            ag = x[3] or DEFAULT_AGENT_NAME
+            if ag in BUILTIN_AGENT_NAMES:
+                return (0, BUILTIN_AGENT_NAMES.index(ag), "")
+            return (1, 0, ag.lower())
         conversations.sort(key=lambda x: x[2], reverse=True)
+        conversations.sort(key=_agent_sort_key)
         return conversations
 
     def _delete_conversation(self, conv_id):
@@ -820,14 +951,83 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.add_message_bubble("assistant", _("Hello! I am Alexy. How can I help you today?"))
 
     def on_conversations_toggled(self, button):
-        """Toggle between chat view and inline conversations list."""
+        """Toggle the conversations list (left sidebar or full-width panel)."""
         if button.get_active():
             self._rebuild_conv_list()
-            self.main_stack.set_visible_child_name("conversations")
-            self.new_conv_btn.set_sensitive(False)
+            self._show_conv()
         else:
-            self.main_stack.set_visible_child_name("chat")
-            self.new_conv_btn.set_sensitive(True)
+            self._hide_conv()
+
+    def _should_use_conv_sidebar(self):
+        """Sidebar (push) mode needs Linexin Center compact mode AND a wide widget.
+
+        When Linexin Center is compact its own sidebar shrinks to an icon strip,
+        leaving room for Alexy to show conversations as a left push-sidebar beside
+        the chat. Otherwise the list slides over the chat as an overlay panel
+        (like the settings sidebar)."""
+        win = getattr(self, 'window', None)
+        compact = bool(getattr(win, '_compact_mode', False)) if win is not None else False
+        width = self.get_width()
+        if width <= 0:
+            width = self.get_allocated_width()
+        return compact and width > 1000
+
+    def _attach_conv(self, mode):
+        """Move conv_page into the revealer for the requested mode ('sidebar'
+        push layout, or 'overlay' floating panel)."""
+        target = self.conv_sidebar_revealer if mode == "sidebar" else self.conv_overlay_revealer
+        other = self.conv_overlay_revealer if mode == "sidebar" else self.conv_sidebar_revealer
+        if target.get_child() is self.conv_page:
+            return
+        if other.get_child() is self.conv_page:
+            other.set_reveal_child(False)
+            other.set_child(None)
+        target.set_child(self.conv_page)
+
+    def _show_conv(self):
+        """Reveal the conversations list, adapting layout to the window size."""
+        # Conversations and settings are mutually exclusive.
+        if getattr(self, 'settings_revealer', None) is not None and \
+                self.settings_revealer.get_reveal_child():
+            self._close_settings_sidebar()
+
+        if self._should_use_conv_sidebar():
+            # Left push-sidebar: fixed width, chat stays beside it and adapts.
+            self._attach_conv("sidebar")
+            self.conv_page.set_size_request(340, -1)
+            self.conv_page.set_hexpand(False)
+            self.conv_page.add_css_class("conv-sidebar")
+            self.conv_page.remove_css_class("conv-panel")
+            self.conv_scrim.set_visible(False)
+            self.conv_overlay_revealer.set_reveal_child(False)
+            self.conv_sidebar_revealer.set_reveal_child(True)
+        else:
+            # Overlay panel that slides over the chat (like the settings sidebar).
+            self._attach_conv("overlay")
+            self.conv_page.set_size_request(360, -1)
+            self.conv_page.set_hexpand(False)
+            self.conv_page.add_css_class("conv-panel")
+            self.conv_page.remove_css_class("conv-sidebar")
+            self.conv_sidebar_revealer.set_reveal_child(False)
+            self.conv_scrim.set_visible(True)
+            self.conv_overlay_revealer.set_reveal_child(True)
+        self.main_stack.set_visible(True)
+        self.new_conv_btn.set_sensitive(True)
+
+    def _hide_conv(self):
+        """Hide the conversations list and restore the chat view."""
+        self.conv_sidebar_revealer.set_reveal_child(False)
+        self.conv_overlay_revealer.set_reveal_child(False)
+        self.conv_scrim.set_visible(False)
+        self.main_stack.set_visible(True)
+        self.new_conv_btn.set_sensitive(True)
+
+    def _on_conv_window_resize(self, *args):
+        """Re-place the conversations list when the window is resized while it
+        is open, so it switches between push-sidebar and overlay on the fly."""
+        if not hasattr(self, 'conv_toggle_btn') or not self.conv_toggle_btn.get_active():
+            return
+        self._show_conv()
 
     def _rebuild_conv_list(self):
         """Populate the inline conversations list with backend filter."""
@@ -839,7 +1039,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             "endpoint": _("Local AI (Endpoint)")
         }
         available_backends = set()
-        for conv_id, title, updated in all_conversations:
+        for conv_id, title, updated, agent in all_conversations:
             filepath = os.path.join(self._get_conversations_dir(), f"{conv_id}.json")
             try:
                 with open(filepath, 'r') as f:
@@ -920,7 +1120,26 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.conv_empty_label.set_visible(len(conversations) == 0)
         self.conv_scrolled.set_visible(len(conversations) > 0)
 
-        for conv_id, title, updated in conversations:
+        last_agent = None
+        for conv_id, title, updated, agent in conversations:
+            agent = agent or DEFAULT_AGENT_NAME
+            # Insert a non-selectable header row whenever the agent changes so
+            # the user can tell which agent each conversation belongs to.
+            if agent != last_agent:
+                last_agent = agent
+                header_row = Gtk.ListBoxRow()
+                header_row.set_selectable(False)
+                header_row.set_activatable(False)
+                header_lbl = Gtk.Label(label=agent)
+                header_lbl.add_css_class("heading")
+                header_lbl.add_css_class("dim-label")
+                header_lbl.set_halign(Gtk.Align.START)
+                header_lbl.set_margin_top(10)
+                header_lbl.set_margin_bottom(2)
+                header_lbl.set_margin_start(6)
+                header_row.set_child(header_lbl)
+                self.conv_listbox.append(header_row)
+
             row = Adw.ActionRow(title=title)
             try:
                 from datetime import datetime
@@ -1077,6 +1296,12 @@ class LinexinAISysadminWidget(Gtk.Box):
         # Spacing goes on the inner box, NOT the row — so default boxed-list separators align
         css_text = """
         box.message-box { margin-top: 10px; margin-bottom: 10px; margin-left: 12px; margin-right: 12px; }
+        .settings-sidebar { background-color: @window_bg_color; border-left: 1px solid @borders; padding-left: 12px; }
+        .settings-sidebar-header { padding: 10px 14px; border-bottom: 1px solid @borders; }
+        .settings-switcher-bar { padding: 8px 14px 0px 14px; }
+        .settings-scrim { background-color: transparent; }
+        .conv-sidebar { border-right: 1px solid @borders; margin-right: 6px; padding-right: 12px; }
+        .conv-panel { background-color: @window_bg_color; border-right: 1px solid @borders; padding-right: 12px; padding-left: 4px; }
         """
 
         # Apply CSS overrides from theme.json (legacy support)
@@ -1209,6 +1434,28 @@ class LinexinAISysadminWidget(Gtk.Box):
                     self.endpoint_url = config.get("endpoint_url", self.endpoint_url)
                     self.endpoint_model = config.get("endpoint_model", self.endpoint_model)
                     self.system_prompt = config.get("system_prompt", self.system_prompt)
+                    # Agents
+                    loaded_agents = config.get("user_agents", [])
+                    if isinstance(loaded_agents, list):
+                        self.user_agents = [
+                            {"name": str(a.get("name", "")), "prompt": str(a.get("prompt", ""))}
+                            for a in loaded_agents
+                            if isinstance(a, dict) and a.get("name")
+                            and a.get("name") not in BUILTIN_AGENT_NAMES
+                        ]
+                    self.active_agent = config.get("active_agent", DEFAULT_AGENT_NAME)
+                    # Migrate a legacy customized master prompt (pre-agents) into
+                    # a dedicated "Custom" agent so it is not lost.
+                    legacy_prompt = config.get("system_prompt", "")
+                    if (legacy_prompt and legacy_prompt != self._default_system_prompt
+                            and not self.user_agents
+                            and "active_agent" not in config):
+                        self.user_agents.append({"name": _("Custom"), "prompt": legacy_prompt})
+                        self.active_agent = _("Custom")
+                    # Ensure the active agent still exists, then sync the prompt.
+                    if self.active_agent not in self._agent_names():
+                        self.active_agent = DEFAULT_AGENT_NAME
+                    self._apply_active_agent()
                     self.stt_backend = config.get("stt_backend", "whisper")
                     self.whisper_model = config.get("whisper_model", "small")
                     self.vosk_lang = config.get("vosk_lang", "small-en-us-0.15")
@@ -1233,6 +1480,8 @@ class LinexinAISysadminWidget(Gtk.Box):
                     "endpoint_url": self.endpoint_url,
                     "endpoint_model": self.endpoint_model,
                     "system_prompt": self.system_prompt,
+                    "user_agents": self.user_agents,
+                    "active_agent": self.active_agent,
                     "stt_backend": self.stt_backend,
                     "whisper_model": self.whisper_model,
                     "vosk_lang": self.vosk_lang,
@@ -1314,16 +1563,22 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.settings_btn.connect("clicked", self.on_settings_clicked)
         header_box.append(self.settings_btn)
 
-        self.append(header_box)
+        # Content column (chat header + main stack). Wrapped in an overlay below
+        # so the settings sidebar can slide in over it from the right.
+        self._content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self._content_box.set_vexpand(True)
+        self._content_box.append(header_box)
 
-        # Main content stack (chat vs conversations list)
+        # Main content stack (chat page). The conversations list is shown either
+        # as a left sidebar (Linexin Center compact mode + wide widget) or as a
+        # full-width panel that hides the chat; see _show_conv()/_hide_conv().
         self.main_stack = Gtk.Stack()
         self.main_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         self.main_stack.set_transition_duration(200)
         self.main_stack.set_vexpand(True)
-        self.append(self.main_stack)
+        self.main_stack.set_hexpand(True)
 
-        # === Conversations Page (added first so slide direction is natural) ===
+        # === Conversations Page ===
         self.conv_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
 
         # Conversation list
@@ -1343,7 +1598,23 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.conv_empty_label.set_visible(False)
         self.conv_page.append(self.conv_empty_label)
 
-        self.main_stack.add_named(self.conv_page, "conversations")
+        # Left conversations sidebar revealer. The same conv_page is reused for
+        # the full-width panel mode (it just fills the area and hides the chat).
+        self.conv_sidebar_revealer = Gtk.Revealer()
+        self.conv_sidebar_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
+        self.conv_sidebar_revealer.set_transition_duration(250)
+        self.conv_sidebar_revealer.set_halign(Gtk.Align.START)
+        self.conv_sidebar_revealer.set_valign(Gtk.Align.FILL)
+        self.conv_sidebar_revealer.set_reveal_child(False)
+        self.conv_sidebar_revealer.set_child(self.conv_page)
+
+        # Horizontal split: [conversations sidebar | chat stack]. The revealer
+        # animates its width, so the chat content adapts (is pushed) smoothly.
+        content_split = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        content_split.set_vexpand(True)
+        content_split.append(self.conv_sidebar_revealer)
+        content_split.append(self.main_stack)
+        self._content_box.append(content_split)
 
         # === Chat Page ===
         chat_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1446,7 +1717,59 @@ class LinexinAISysadminWidget(Gtk.Box):
         self.main_stack.add_named(chat_page, "chat")
         self.main_stack.set_visible_child_name("chat")
 
-        # Setup real-time dark mode class tracking for themes
+        # Wrap the content column in an overlay and add the sliding settings
+        # sidebar (revealer) plus a dim scrim behind it.
+        self.root_overlay = Gtk.Overlay()
+        self.root_overlay.set_child(self._content_box)
+
+        # Conversations overlay panel (used in non-compact / narrow mode). It
+        # slides over the chat like the settings sidebar and never affects the
+        # chat's layout size. In compact + wide mode the same conv_page is moved
+        # into the left push-sidebar (conv_sidebar_revealer) instead.
+        self.conv_scrim = Gtk.Box()
+        self.conv_scrim.add_css_class("settings-scrim")
+        self.conv_scrim.set_visible(False)
+        _conv_scrim_click = Gtk.GestureClick()
+        _conv_scrim_click.connect("released", lambda *a: self.conv_toggle_btn.set_active(False))
+        self.conv_scrim.add_controller(_conv_scrim_click)
+        self.root_overlay.add_overlay(self.conv_scrim)
+
+        self.conv_overlay_revealer = Gtk.Revealer()
+        self.conv_overlay_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
+        self.conv_overlay_revealer.set_transition_duration(250)
+        self.conv_overlay_revealer.set_halign(Gtk.Align.START)
+        self.conv_overlay_revealer.set_valign(Gtk.Align.FILL)
+        self.conv_overlay_revealer.set_reveal_child(False)
+        self.root_overlay.add_overlay(self.conv_overlay_revealer)
+
+        # Dim scrim behind the sidebar; clicking it dismisses the sidebar.
+        self.settings_scrim = Gtk.Box()
+        self.settings_scrim.add_css_class("settings-scrim")
+        self.settings_scrim.set_visible(False)
+        _scrim_click = Gtk.GestureClick()
+        _scrim_click.connect("released", lambda *a: self._close_settings_sidebar())
+        self.settings_scrim.add_controller(_scrim_click)
+        self.root_overlay.add_overlay(self.settings_scrim)
+
+        # Right-hand sliding settings sidebar.
+        self.settings_revealer = Gtk.Revealer()
+        self.settings_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_LEFT)
+        self.settings_revealer.set_transition_duration(250)
+        self.settings_revealer.set_halign(Gtk.Align.END)
+        self.settings_revealer.set_valign(Gtk.Align.FILL)
+        self.settings_revealer.set_reveal_child(False)
+        self.root_overlay.add_overlay(self.settings_revealer)
+
+        self.append(self.root_overlay)
+
+        # Re-evaluate the conversations layout (sidebar vs overlay) live when the
+        # window is resized while the list is open.
+        if getattr(self, 'window', None) is not None:
+            try:
+                self.window.connect("notify::default-width", self._on_conv_window_resize)
+            except Exception:
+                pass
+        self.connect("map", lambda *a: self._on_conv_window_resize())
         style_manager = Adw.StyleManager.get_default()
         def _on_dark_changed(*_args):
             if style_manager.get_dark():
@@ -1927,6 +2250,51 @@ class LinexinAISysadminWidget(Gtk.Box):
         elif self.backend == "endpoint":
             self.subtitle_label.set_label(_("Local AI: {}").format(self.endpoint_model or _("auto-detected")))
 
+    def _markdown_to_pango(self, text_content):
+        """Convert a subset of Markdown to Pango markup for message labels."""
+        import html
+        import re
+        escaped_content = html.escape(text_content)
+
+        # Triple backticks (with optional language specifier)
+        parsed_markup = re.sub(r'```[a-zA-Z0-9]*\n?(.*?)```', r'<tt>\1</tt>', escaped_content, flags=re.DOTALL)
+        # Single backticks (now supporting multiline)
+        parsed_markup = re.sub(r'`(.*?)`', r'<tt>\1</tt>', parsed_markup, flags=re.DOTALL)
+
+        # Protect <tt> blocks from bold/italic processing (underscores in filenames etc.)
+        _tt_blocks = []
+        def _save_tt(m):
+            _tt_blocks.append(m.group(0))
+            return f'\x00TT{len(_tt_blocks)-1}\x00'
+        parsed_markup = re.sub(r'<tt>.*?</tt>', _save_tt, parsed_markup, flags=re.DOTALL)
+
+        # Headings (up to H3 as they map cleanly to big text in Pango)
+        parsed_markup = re.sub(r'^### (.*?)$', r'<span size="large" weight="bold">\1</span>', parsed_markup, flags=re.MULTILINE)
+        parsed_markup = re.sub(r'^## (.*?)$', r'<span size="x-large" weight="bold">\1</span>', parsed_markup, flags=re.MULTILINE)
+        parsed_markup = re.sub(r'^# (.*?)$', r'<span size="xx-large" weight="bold">\1</span>', parsed_markup, flags=re.MULTILINE)
+
+        # Lists
+        parsed_markup = re.sub(r'^[-*]\s+(.*?)$', r'  • \1', parsed_markup, flags=re.MULTILINE)
+        parsed_markup = re.sub(r'^(\d+)\.\s+(.*?)$', r'  \1. \2', parsed_markup, flags=re.MULTILINE)
+
+        # Bold
+        parsed_markup = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', parsed_markup, flags=re.DOTALL)
+        # Italic (Must be parsed after Bold to prevent double-asterisk conflicts)
+        parsed_markup = re.sub(r'\*(.*?)\*', r'<i>\1</i>', parsed_markup)
+        parsed_markup = re.sub(r'_(.*?)_', r'<i>\1</i>', parsed_markup)
+
+        # Restore <tt> blocks
+        for i, block in enumerate(_tt_blocks):
+            parsed_markup = parsed_markup.replace(f'\x00TT{i}\x00', block)
+        return parsed_markup
+
+    def _scroll_chat_to_bottom(self):
+        """Scroll the chat view to the bottom."""
+        adj = self.scrolled_window.get_vadjustment()
+        if adj:
+            adj.set_value(adj.get_upper() - adj.get_page_size())
+        return False
+
     def add_message_bubble(self, role, content, is_html=False):
         row = Gtk.ListBoxRow()
         row.set_selectable(False)
@@ -1965,42 +2333,7 @@ class LinexinAISysadminWidget(Gtk.Box):
         else:
             text_content = content
 
-        import html
-        escaped_content = html.escape(text_content)
-        
-        # Super-basic Markdown -> Pango Markup parser for LLM Aesthetics
-        import re
-        
-        # Triple backticks (with optional language specifier)
-        parsed_markup = re.sub(r'```[a-zA-Z0-9]*\n?(.*?)```', r'<tt>\1</tt>', escaped_content, flags=re.DOTALL)
-        # Single backticks (now supporting multiline)
-        parsed_markup = re.sub(r'`(.*?)`', r'<tt>\1</tt>', parsed_markup, flags=re.DOTALL)
-        
-        # Protect <tt> blocks from bold/italic processing (underscores in filenames etc.)
-        _tt_blocks = []
-        def _save_tt(m):
-            _tt_blocks.append(m.group(0))
-            return f'\x00TT{len(_tt_blocks)-1}\x00'
-        parsed_markup = re.sub(r'<tt>.*?</tt>', _save_tt, parsed_markup, flags=re.DOTALL)
-        
-        # Headings (up to H3 as they map cleanly to big text in Pango)
-        parsed_markup = re.sub(r'^### (.*?)$', r'<span size="large" weight="bold">\1</span>', parsed_markup, flags=re.MULTILINE)
-        parsed_markup = re.sub(r'^## (.*?)$', r'<span size="x-large" weight="bold">\1</span>', parsed_markup, flags=re.MULTILINE)
-        parsed_markup = re.sub(r'^# (.*?)$', r'<span size="xx-large" weight="bold">\1</span>', parsed_markup, flags=re.MULTILINE)
-        
-        # Lists
-        parsed_markup = re.sub(r'^[-*]\s+(.*?)$', r'  • \1', parsed_markup, flags=re.MULTILINE)
-        parsed_markup = re.sub(r'^(\d+)\.\s+(.*?)$', r'  \1. \2', parsed_markup, flags=re.MULTILINE)
-        
-        # Bold
-        parsed_markup = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', parsed_markup, flags=re.DOTALL)
-        # Italic (Must be parsed after Bold to prevent double-asterisk conflicts)
-        parsed_markup = re.sub(r'\*(.*?)\*', r'<i>\1</i>', parsed_markup)
-        parsed_markup = re.sub(r'_(.*?)_', r'<i>\1</i>', parsed_markup)
-        
-        # Restore <tt> blocks
-        for i, block in enumerate(_tt_blocks):
-            parsed_markup = parsed_markup.replace(f'\x00TT{i}\x00', block)
+        parsed_markup = self._markdown_to_pango(text_content)
 
         if role == "user":
             box.set_halign(Gtk.Align.END)
@@ -2085,18 +2418,257 @@ class LinexinAISysadminWidget(Gtk.Box):
         adj = self.scrolled_window.get_vadjustment()
         GLib.idle_add(lambda: adj.set_value(adj.get_upper() - adj.get_page_size()) if adj.get_upper() > adj.get_page_size() else False)
 
-    def on_settings_clicked(self, button):
-        window = Adw.PreferencesWindow(
-            transient_for=self.window if self.window else self.get_root(),
-            title=_("Settings"),
-            search_enabled=False,
-            default_width=600,
-            default_height=750
-        )
+    def _close_settings_sidebar(self):
+        """Apply any pending settings and slide the settings sidebar closed."""
+        cb = getattr(self, '_settings_apply_cb', None)
+        if cb is not None:
+            try:
+                cb()
+            except Exception as e:
+                print(f"Error applying settings: {e}")
+            self._settings_apply_cb = None
+        if getattr(self, 'settings_revealer', None) is not None:
+            self.settings_revealer.set_reveal_child(False)
+        if getattr(self, 'settings_scrim', None) is not None:
+            self.settings_scrim.set_visible(False)
 
-        # Page 1: LLM Connection
-        page_llm = Adw.PreferencesPage(title=_("LLM Connection"), icon_name="network-server-symbolic")
-        window.add(page_llm)
+    def _build_agents_page(self):
+        """Build the 'Agents' settings page. Returns (page, get_state) where
+        get_state() -> (user_agents_list, active_agent_name) reflecting the
+        user's edits, to be committed when settings are applied."""
+        page = Adw.PreferencesPage()
+
+        # Working copy of the custom agents (built-in agents are implicit).
+        working = [dict(a) for a in self.user_agents]
+        names_all = list(BUILTIN_AGENT_NAMES) + [a["name"] for a in working]
+        start_active = self.active_agent if self.active_agent in names_all else DEFAULT_AGENT_NAME
+
+        select_group = Adw.PreferencesGroup(
+            title=_("Agents"),
+            description=_("Agents are named master-prompt profiles. Select one to use for new conversations, or create your own. The built-in agents cannot be edited.")
+        )
+        page.add(select_group)
+
+        combo = Adw.ComboRow(title=_("Active Agent"), subtitle=_("Applied to new conversations"))
+        select_group.add(combo)
+
+        new_row = Adw.ActionRow(title=_("Create New Agent"),
+                                subtitle=_("Start from a copy of the default prompt"))
+        new_btn = Gtk.Button(label=_("New Agent"), valign=Gtk.Align.CENTER)
+        new_btn.add_css_class("suggested-action")
+        new_row.add_suffix(new_btn)
+        new_row.set_activatable_widget(new_btn)
+        select_group.add(new_row)
+
+        editor_group = Adw.PreferencesGroup()
+        page.add(editor_group)
+        editor_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        editor_group.add(editor_box)
+
+        ed = {"current_name": start_active, "buffer": None, "loading": False}
+
+        def names_list():
+            return list(BUILTIN_AGENT_NAMES) + [a["name"] for a in working]
+
+        def find_agent(name):
+            for a in working:
+                if a["name"] == name:
+                    return a
+            return None
+
+        def clear_box():
+            child = editor_box.get_first_child()
+            while child is not None:
+                editor_box.remove(child)
+                child = editor_box.get_first_child()
+
+        def commit_editor():
+            name = ed.get("current_name")
+            if name and name not in BUILTIN_AGENT_NAMES and ed["buffer"] is not None:
+                a = find_agent(name)
+                if a is not None:
+                    b = ed["buffer"]
+                    a["prompt"] = b.get_text(b.get_start_iter(), b.get_end_iter(), False)
+
+        def make_prompt_view(text, editable):
+            view = Gtk.TextView()
+            view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            view.set_editable(editable)
+            view.set_cursor_visible(editable)
+            view.set_top_margin(8)
+            view.set_bottom_margin(8)
+            view.set_left_margin(8)
+            view.set_right_margin(8)
+            view.get_buffer().set_text(text)
+            if not editable:
+                view.add_css_class("dim-label")
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroll.set_min_content_height(220)
+            scroll.set_child(view)
+            scroll.add_css_class("card")
+            return scroll, view
+
+        def build_editor(name):
+            clear_box()
+            ed["current_name"] = name
+            ed["buffer"] = None
+            if name in BUILTIN_AGENT_NAMES:
+                info = Gtk.Label(label=_("This is a built-in agent. Its prompt is shown for reference and cannot be edited."))
+                info.add_css_class("dim-label")
+                info.add_css_class("caption")
+                info.set_wrap(True)
+                info.set_halign(Gtk.Align.START)
+                editor_box.append(info)
+                scroll, _view = make_prompt_view(self._agent_prompt(name), False)
+                editor_box.append(scroll)
+            else:
+                a = find_agent(name)
+                prompt_text = a.get("prompt", self._default_system_prompt) if a else self._default_system_prompt
+                scroll, view = make_prompt_view(prompt_text, True)
+                ed["buffer"] = view.get_buffer()
+                editor_box.append(scroll)
+
+                button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                button_box.set_halign(Gtk.Align.END)
+
+                rename_btn = Gtk.Button(label=_("Rename Agent"))
+
+                def on_rename(btn, nm=name):
+                    commit_editor()
+                    parent = self.window if self.window else self.get_root()
+                    dialog = Adw.MessageDialog(
+                        transient_for=parent,
+                        heading=_("Rename Agent"),
+                        body=_("Enter a new name for this agent.")
+                    )
+                    entry = Gtk.Entry()
+                    entry.set_text(nm)
+                    dialog.set_extra_child(entry)
+                    dialog.add_response("cancel", _("Cancel"))
+                    dialog.add_response("rename", _("Rename"))
+                    dialog.set_response_appearance("rename", Adw.ResponseAppearance.SUGGESTED)
+                    dialog.set_default_response("rename")
+
+                    def on_response(dlg, response):
+                        if response == "rename":
+                            new_name = entry.get_text().strip()
+                            existing = [n.lower() for n in names_list() if n.lower() != nm.lower()]
+                            if new_name and new_name.lower() not in existing:
+                                target = find_agent(nm)
+                                if target is not None:
+                                    target["name"] = new_name
+                                ed["current_name"] = new_name
+                                refresh_combo(new_name)
+                        dlg.destroy()
+                    dialog.connect("response", on_response)
+                    entry.connect("activate", lambda e: dialog.response("rename"))
+                    dialog.present()
+                rename_btn.connect("clicked", on_rename)
+                button_box.append(rename_btn)
+
+                delete_btn = Gtk.Button(label=_("Delete Agent"))
+                delete_btn.add_css_class("destructive-action")
+
+                def on_delete(btn, nm=name):
+                    target = find_agent(nm)
+                    if target is not None:
+                        working.remove(target)
+                    ed["buffer"] = None
+                    ed["current_name"] = DEFAULT_AGENT_NAME
+                    refresh_combo(DEFAULT_AGENT_NAME)
+                delete_btn.connect("clicked", on_delete)
+                button_box.append(delete_btn)
+
+                editor_box.append(button_box)
+
+        def refresh_combo(select_name):
+            ed["loading"] = True
+            sl = Gtk.StringList()
+            for n in names_list():
+                sl.append(n)
+            combo.set_model(sl)
+            names = names_list()
+            idx = names.index(select_name) if select_name in names else 0
+            combo.set_selected(idx)
+            ed["loading"] = False
+            build_editor(names[idx])
+
+        def on_combo_changed(row, _pspec):
+            if ed["loading"]:
+                return
+            commit_editor()
+            names = names_list()
+            sel = row.get_selected()
+            if 0 <= sel < len(names):
+                build_editor(names[sel])
+
+        combo.connect("notify::selected", on_combo_changed)
+
+        def on_new_agent(btn):
+            commit_editor()
+            parent = self.window if self.window else self.get_root()
+            dialog = Adw.MessageDialog(
+                transient_for=parent,
+                heading=_("New Agent"),
+                body=_("Enter a name for the new agent.")
+            )
+            entry = Gtk.Entry()
+            entry.set_placeholder_text(_("Agent name"))
+            dialog.set_extra_child(entry)
+            dialog.add_response("cancel", _("Cancel"))
+            dialog.add_response("create", _("Create"))
+            dialog.set_response_appearance("create", Adw.ResponseAppearance.SUGGESTED)
+            dialog.set_default_response("create")
+
+            def on_response(dlg, response):
+                if response == "create":
+                    name = entry.get_text().strip()
+                    existing = [n.lower() for n in names_list()]
+                    if name and name.lower() not in existing:
+                        working.append({"name": name, "prompt": self._default_system_prompt})
+                        refresh_combo(name)
+                dlg.destroy()
+            dialog.connect("response", on_response)
+            entry.connect("activate", lambda e: dialog.response("create"))
+            dialog.present()
+        new_btn.connect("clicked", on_new_agent)
+
+        refresh_combo(start_active)
+
+        def get_state():
+            commit_editor()
+            names = names_list()
+            sel = combo.get_selected()
+            active = names[sel] if 0 <= sel < len(names) else DEFAULT_AGENT_NAME
+            return [dict(a) for a in working], active
+
+        return page, get_state
+
+    def on_settings_clicked(self, button):
+        # Toggle: if the sidebar is already open, close it (and apply).
+        if getattr(self, 'settings_revealer', None) is not None and self.settings_revealer.get_reveal_child():
+            self._close_settings_sidebar()
+            return
+
+        # Conversations and settings are mutually exclusive.
+        if getattr(self, 'conv_toggle_btn', None) is not None and self.conv_toggle_btn.get_active():
+            self.conv_toggle_btn.set_active(False)
+
+        settings_parent = self.window if self.window else self.get_root()
+
+        # Categorized settings hosted inside the sliding sidebar. A ViewStack
+        # holds three pages (Assistant, Speech, Theme) selected by a ViewSwitcher
+        # in the sidebar header, restoring the original organization.
+        settings_view_stack = Adw.ViewStack()
+        page_llm = Adw.PreferencesPage()
+        settings_view_stack.add_titled_with_icon(
+            page_llm, "assistant", _("Assistant"), "preferences-system-symbolic")
+
+        # Agents tab: manage named master-prompt profiles.
+        agents_page, get_agents_state = self._build_agents_page()
+        settings_view_stack.add_titled_with_icon(
+            agents_page, "agents", _("Agents"), "system-users-symbolic")
         
         safety_group = Adw.PreferencesGroup(title=_("General Settings"))
         page_llm.add(safety_group)
@@ -2180,7 +2752,7 @@ class LinexinAISysadminWidget(Gtk.Box):
                 def do_uninstall():
                     cmd = "pacman -Qi ollama &>/dev/null && pacman -Rns ollama --noconfirm || { systemctl disable --now ollama 2>/dev/null; rm -f /usr/local/bin/ollama; rm -rf /usr/local/lib/ollama; rm -f /etc/systemd/system/ollama.service; systemctl daemon-reload; }"
                     win_uninstall = _ActionProgressWindow(
-                        parent=window,
+                        parent=settings_parent,
                         title=_("Uninstalling Ollama"),
                         cmd_string=cmd,
                         sudo_manager=self.sudo_manager
@@ -2216,7 +2788,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             def do_install():
                 cmd = "curl -fsSL https://ollama.com/install.sh | sh"
                 win_install = _ActionProgressWindow(
-                    parent=window,
+                    parent=settings_parent,
                     title=_("Installing Ollama"),
                     cmd_string=cmd,
                     sudo_manager=self.sudo_manager,
@@ -2311,9 +2883,10 @@ class LinexinAISysadminWidget(Gtk.Box):
         backend_row.connect("notify::selected", sync_backend_visibility)
         sync_backend_visibility() # apply initial state
 
-        # Page 2: Speech & Audio
-        page_speech = Adw.PreferencesPage(title=_("Speech & Audio"), icon_name="audio-speakers-symbolic")
-        window.add(page_speech)
+        # Section 2: Speech & Audio
+        page_speech = Adw.PreferencesPage()
+        settings_view_stack.add_titled_with_icon(
+            page_speech, "speech", _("Speech"), "audio-input-microphone-symbolic")
         
         # --- STT Backend Selector ---
         stt_engine_group = Adw.PreferencesGroup(title=_("Voice-to-Text Engine"))
@@ -2372,7 +2945,7 @@ class LinexinAISysadminWidget(Gtk.Box):
             def on_vosk_install_clicked(btn):
                 def do_install():
                     win_install = _ActionProgressWindow(
-                        parent=window,
+                        parent=settings_parent,
                         title=_("Installing python-vosk"),
                         cmd_string="pacman -Sy python-vosk --noconfirm",
                         sudo_manager=self.sudo_manager
@@ -2470,9 +3043,10 @@ class LinexinAISysadminWidget(Gtk.Box):
         direct_vc_row.set_active(self.voice_correction_direct)
         vc_group.add(direct_vc_row)
 
-        # Page 3: Theme
-        page_theme = Adw.PreferencesPage(title=_("Theme"), icon_name="applications-graphics-symbolic")
-        window.add(page_theme)
+        # Section 3: Theme
+        page_theme = Adw.PreferencesPage()
+        settings_view_stack.add_titled_with_icon(
+            page_theme, "theme", _("Theme"), "applications-graphics-symbolic")
 
         theme_group = Adw.PreferencesGroup(title=_("Appearance"), description=_("Select a theme to customize the look of the AI assistant."))
         page_theme.add(theme_group)
@@ -2548,7 +3122,20 @@ class LinexinAISysadminWidget(Gtk.Box):
         info_label.set_wrap(True)
         info_group.add(info_label)
 
-        def on_window_close_request(win):
+        def apply_settings():
+            # Agents: commit the user's agent edits and selection, then sync the
+            # active master prompt so new conversations use it.
+            self.user_agents, self.active_agent = get_agents_state()
+            if self.active_agent not in self._agent_names():
+                self.active_agent = DEFAULT_AGENT_NAME
+            self._apply_active_agent()
+
+            # If the current conversation is still empty (no messages exchanged
+            # yet), retroactively apply the newly selected agent to it so the
+            # user does not have to start a new conversation manually.
+            if len(self.chat_history) <= 1:
+                self._reset_history()
+
             idx = backend_row.get_selected()
             old_backend = self.backend
             if idx == 0:
@@ -2610,11 +3197,9 @@ class LinexinAISysadminWidget(Gtk.Box):
                 if new_theme != self.theme:
                     self.theme = new_theme
                     self._load_theme()
-                    # Refresh header icon and stt icon
-                    header_svg = self._get_theme_svg("header-icon.svg")
-                    if header_svg:
-                        self.header_icon_widget.set_from_file(header_svg)
-                    elif os.path.isfile(self.alexy_icon_path):
+                    # The Alexy AI icon is intentionally NOT themeable; only the
+                    # microphone icon may be overridden by a theme.
+                    if os.path.isfile(self.alexy_icon_path):
                         self.header_icon_widget.set_from_file(self.alexy_icon_path)
                     else:
                         self.header_icon_widget.set_from_icon_name("system-run-symbolic")
@@ -2628,11 +3213,53 @@ class LinexinAISysadminWidget(Gtk.Box):
 
             self.save_config()
             self.update_subtitle()
-            return False
-            
-        window.connect("close-request", on_window_close_request)
-        translate_window(window)
-        window.present()
+
+        self._settings_apply_cb = apply_settings
+
+        # Build the sidebar chrome (header with title + close) around the page.
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        sidebar.add_css_class("settings-sidebar")
+        sidebar.set_size_request(400, -1)
+
+        sidebar_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        sidebar_header.add_css_class("settings-sidebar-header")
+        settings_title = Gtk.Label(label=_("Settings"))
+        settings_title.add_css_class("title-2")
+        settings_title.set_hexpand(True)
+        settings_title.set_halign(Gtk.Align.START)
+        sidebar_header.append(settings_title)
+        close_settings_btn = Gtk.Button()
+        _set_button_icon(close_settings_btn, "window-close-symbolic", "window-close", text_fallback="\u2715")
+        close_settings_btn.add_css_class("flat")
+        close_settings_btn.add_css_class("circular")
+        close_settings_btn.set_valign(Gtk.Align.CENTER)
+        close_settings_btn.set_tooltip_text(_("Close"))
+        close_settings_btn.connect("clicked", lambda *a: self._close_settings_sidebar())
+        sidebar_header.append(close_settings_btn)
+        sidebar.append(sidebar_header)
+
+        # Category switcher bar (Assistant / Speech / Theme).
+        settings_switcher = Adw.ViewSwitcher()
+        settings_switcher.set_stack(settings_view_stack)
+        settings_switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
+        settings_switcher.set_halign(Gtk.Align.CENTER)
+        switcher_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        switcher_bar.add_css_class("settings-switcher-bar")
+        switcher_bar.set_halign(Gtk.Align.CENTER)
+        switcher_bar.append(settings_switcher)
+        sidebar.append(switcher_bar)
+
+        settings_view_stack.set_vexpand(True)
+        sidebar.append(settings_view_stack)
+
+        self.settings_revealer.set_child(sidebar)
+        try:
+            translate_dialog(sidebar)
+        except Exception:
+            pass
+
+        self.settings_scrim.set_visible(True)
+        self.settings_revealer.set_reveal_child(True)
 
     def launch_in_app_process(self, title, cmd_string, is_ollama=False, initial_status=None, on_close_callback=None, sudo_manager=None, model_name=None):
         """Robustly launch a subprocess and stream its output to a native GTK _ActionProgressWindow."""
@@ -2816,6 +3443,7 @@ class LinexinAISysadminWidget(Gtk.Box):
         self._stop_tts()
         self.abort_processing = True
         self.llm_processing = False
+        self._stream_discard()
         self.spinner.stop()
         self.spinner.set_visible(False)
         self.entry.set_sensitive(True)
@@ -3386,6 +4014,327 @@ class LinexinAISysadminWidget(Gtk.Box):
                 pass
             self._thinking_row = None
 
+    # ----------------------------------------------------------------- #
+    #  Streaming assistant reply (word-by-word typewriter + reasoning)   #
+    # ----------------------------------------------------------------- #
+
+    def _stream_begin(self):
+        """Create the streaming assistant bubble and start the typewriter.
+
+        Runs on the main loop. Replaces the 'Thinking...' indicator with a real
+        assistant bubble that grows as tokens arrive. A collapsible 'reasoning'
+        section is added lazily the first time reasoning text appears.
+        """
+        self._remove_thinking_indicator()
+
+        # Maintain message grouping (directional tails) like add_message_bubble.
+        if not hasattr(self, '_last_bubble_role'):
+            self._last_bubble_role = None
+            self._last_bubble_box = None
+        if self._last_bubble_role == "assistant" and self._last_bubble_box:
+            self._last_bubble_box.remove_css_class("last-in-group")
+
+        row = Gtk.ListBoxRow()
+        row.set_selectable(False)
+        row.add_css_class("message-row")
+        row.add_css_class("assistant-message-row")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        box.add_css_class("message-box")
+        box.add_css_class("assistant-message-box")
+        box.add_css_class("last-in-group")
+        box.set_halign(Gtk.Align.FILL)
+        box.set_hexpand(True)
+        self._last_bubble_role = "assistant"
+        self._last_bubble_box = box
+
+        if os.path.isfile(self.alexy_icon_path):
+            icon = Gtk.Image.new_from_file(self.alexy_icon_path)
+        else:
+            icon = Gtk.Image.new_from_icon_name(self.widgeticon)
+        icon.set_pixel_size(24)
+        icon.set_valign(Gtk.Align.START)
+        box.append(icon)
+
+        bubble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        bubble.add_css_class("message-bubble")
+        bubble.add_css_class("assistant-bubble")
+        bubble.set_halign(Gtk.Align.FILL)
+        bubble.set_hexpand(True)
+
+        content_label = Gtk.Label()
+        content_label.add_css_class("message-label")
+        content_label.set_halign(Gtk.Align.FILL)
+        content_label.set_hexpand(True)
+        content_label.set_wrap(True)
+        content_label.set_selectable(True)
+        content_label.set_xalign(0.0)
+        bubble.append(content_label)
+
+        box.append(bubble)
+        row.set_child(box)
+        self.chat_listbox.append(row)
+
+        self._stream_ctx = {
+            "row": row,
+            "bubble": bubble,
+            "content_label": content_label,
+            "reasoning_expander": None,
+            "reasoning_label": None,
+            "reasoning_spinner": None,
+            # Raw accumulators (filled from the worker thread via _stream_push).
+            "raw_content": "",
+            "reasoning_field": "",
+            # Targets derived from the accumulators.
+            "content_target": "",
+            "reasoning_target": "",
+            # How much has been revealed by the typewriter so far.
+            "content_shown": 0,
+            "reasoning_shown": 0,
+            "done": False,
+            "reply": "",
+            "speak": False,
+            "final": True,
+            "finished": False,
+        }
+        self._stream_tick_id = GLib.timeout_add(16, self._stream_tick, self._stream_ctx)
+        GLib.timeout_add(60, self._scroll_chat_to_bottom)
+
+    def _ensure_reasoning_expander(self):
+        """Lazily create the collapsible reasoning section inside the bubble."""
+        ctx = self._stream_ctx
+        if ctx is None or ctx["reasoning_expander"] is not None:
+            return
+        expander = Gtk.Expander()
+        expander.set_expanded(False)
+        expander.add_css_class("reasoning-expander")
+        expander.set_halign(Gtk.Align.FILL)
+        expander.set_hexpand(True)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        header.set_halign(Gtk.Align.FILL)
+        header.set_hexpand(True)
+        spinner = Gtk.Spinner()
+        spinner.start()
+        header.append(spinner)
+        title = Gtk.Label(label=_("Thinking..."))
+        title.add_css_class("dim-label")
+        title.add_css_class("caption")
+        title.set_halign(Gtk.Align.START)
+        title.set_hexpand(True)
+        header.append(title)
+        expander.set_label_widget(header)
+
+        reasoning_label = Gtk.Label()
+        reasoning_label.add_css_class("reasoning-text")
+        reasoning_label.add_css_class("dim-label")
+        reasoning_label.set_halign(Gtk.Align.FILL)
+        reasoning_label.set_hexpand(True)
+        reasoning_label.set_wrap(True)
+        reasoning_label.set_selectable(True)
+        reasoning_label.set_xalign(0.0)
+        reasoning_label.set_margin_top(6)
+        reasoning_label.set_margin_start(6)
+        reasoning_label.set_margin_bottom(6)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_max_content_height(220)
+        scroll.set_propagate_natural_height(True)
+        scroll.set_halign(Gtk.Align.FILL)
+        scroll.set_hexpand(True)
+        scroll.set_child(reasoning_label)
+        expander.set_child(scroll)
+
+        # Insert the expander above the content label.
+        ctx["bubble"].prepend(expander)
+        ctx["reasoning_expander"] = expander
+        ctx["reasoning_label"] = reasoning_label
+        ctx["reasoning_spinner"] = spinner
+        ctx["reasoning_title"] = title
+
+    def _recompute_stream_targets(self):
+        """Derive visible content + reasoning targets from the raw accumulators.
+
+        Inline <think>...</think> blocks in the content channel are routed to the
+        reasoning section, so models that embed their chain-of-thought in the
+        normal content stream are handled the same as those using a dedicated
+        reasoning field.
+        """
+        import re
+        ctx = self._stream_ctx
+        if ctx is None:
+            return
+        raw = ctx["raw_content"]
+        inline_reasoning = []
+        visible = []
+        inside = False
+        for part in re.split(r'(<think>|</think>)', raw):
+            if part == "<think>":
+                inside = True
+                continue
+            if part == "</think>":
+                inside = False
+                continue
+            if inside:
+                inline_reasoning.append(part)
+            else:
+                visible.append(part)
+        reasoning = ctx["reasoning_field"]
+        if inline_reasoning:
+            reasoning = reasoning + "".join(inline_reasoning)
+        ctx["content_target"] = "".join(visible)
+        ctx["reasoning_target"] = reasoning
+        if reasoning.strip():
+            self._ensure_reasoning_expander()
+
+    def _stream_push(self, content_delta, reasoning_delta):
+        """Append newly received tokens (called on the main loop)."""
+        ctx = self._stream_ctx
+        if ctx is None:
+            return False
+        if content_delta:
+            ctx["raw_content"] += content_delta
+        if reasoning_delta:
+            ctx["reasoning_field"] += reasoning_delta
+        self._recompute_stream_targets()
+        return False
+
+    def _stream_tick(self, ctx):
+        """Typewriter animation: reveal a few more characters each frame.
+
+        Bound to a specific context so that a follow-up reply (e.g. after
+        autonomous command execution starts a new bubble) animates its own
+        bubble independently.
+        """
+        if ctx is None:
+            return False
+
+        advanced = False
+        # Reveal reasoning text.
+        r_target = ctx["reasoning_target"]
+        if ctx["reasoning_shown"] < len(r_target):
+            remaining = len(r_target) - ctx["reasoning_shown"]
+            step = max(3, remaining // 8)
+            ctx["reasoning_shown"] = min(len(r_target), ctx["reasoning_shown"] + step)
+            if ctx["reasoning_label"] is not None:
+                ctx["reasoning_label"].set_text(r_target[:ctx["reasoning_shown"]])
+            advanced = True
+
+        # Reveal main content text.
+        c_target = ctx["content_target"]
+        if ctx["content_shown"] < len(c_target):
+            remaining = len(c_target) - ctx["content_shown"]
+            step = max(2, remaining // 10)
+            ctx["content_shown"] = min(len(c_target), ctx["content_shown"] + step)
+            ctx["content_label"].set_text(c_target[:ctx["content_shown"]])
+            advanced = True
+
+        if advanced:
+            self._scroll_chat_to_bottom()
+
+        caught_up = (ctx["content_shown"] >= len(c_target)
+                     and ctx["reasoning_shown"] >= len(r_target))
+        if ctx["done"] and caught_up:
+            self._stream_complete(ctx)
+            return False
+        return True
+
+    def _stream_finish(self, reply, speak, final=True):
+        """Signal that the network stream has ended (called on the main loop).
+
+        The typewriter keeps running until it catches up, then _stream_complete
+        finalizes the bubble. 'final' is False for the intermediate reply that
+        triggers autonomous command execution (input stays locked).
+        """
+        ctx = getattr(self, "_stream_ctx", None)
+        if ctx is None:
+            # Nothing was streamed (e.g. immediate empty reply): fall back.
+            if final:
+                self.on_api_success(reply)
+            return False
+        ctx["reply"] = reply
+        ctx["speak"] = speak
+        ctx["final"] = final
+        ctx["done"] = True
+        return False
+
+    def _stream_complete(self, ctx):
+        """Finalize the streamed bubble: apply markup, unlock input, TTS."""
+        if ctx is None or ctx.get("finished"):
+            return
+        ctx["finished"] = True
+
+        reply = ctx["reply"]
+        speak = ctx["speak"]
+        final = ctx["final"]
+
+        # Apply full Markdown -> Pango markup now that the text is complete.
+        if reply.strip():
+            try:
+                ctx["content_label"].set_markup(self._markdown_to_pango(reply))
+            except Exception:
+                ctx["content_label"].set_text(reply)
+        else:
+            # No visible content (pure reasoning or empty) -> drop empty label.
+            ctx["content_label"].set_visible(False)
+
+        # Finalize the reasoning section: stop the spinner and relabel.
+        if ctx["reasoning_expander"] is not None:
+            if ctx["reasoning_spinner"] is not None:
+                ctx["reasoning_spinner"].stop()
+                ctx["reasoning_spinner"].set_visible(False)
+            if ctx.get("reasoning_title") is not None:
+                ctx["reasoning_title"].set_text(_("Reasoning"))
+
+        # If this is the currently-active context, clear the pointer.
+        if getattr(self, "_stream_ctx", None) is ctx:
+            self._stream_ctx = None
+
+        # Intermediate reply (autonomous commands running): keep input locked.
+        if not final:
+            return
+
+        self._cleanup_screenshot_tmp()
+
+        if speak:
+            self._speak_next_response = False
+            self.llm_processing = False
+            self.spinner.stop()
+            self.spinner.set_visible(False)
+            self._save_conversation()
+            self.play_tts(reply)
+        else:
+            self.llm_processing = False
+            self.entry.set_sensitive(True)
+            self.send_btn.set_icon_name(self._icon_send)
+            self.stt_toggle.set_sensitive(True)
+            self.new_conv_btn.set_sensitive(True)
+            self.conv_toggle_btn.set_sensitive(True)
+            self.settings_btn.set_sensitive(True)
+            self.spinner.stop()
+            self.spinner.set_visible(False)
+            self.entry.grab_focus()
+            self._save_conversation()
+
+    def _stream_discard(self):
+        """Remove the in-progress streaming bubble (on error/abort)."""
+        ctx = getattr(self, "_stream_ctx", None)
+        if ctx is None:
+            return
+        if getattr(self, "_stream_tick_id", None):
+            try:
+                GLib.source_remove(self._stream_tick_id)
+            except Exception:
+                pass
+            self._stream_tick_id = None
+        try:
+            self.chat_listbox.remove(ctx["row"])
+        except Exception:
+            pass
+        self._last_bubble_role = None
+        self._last_bubble_box = None
+        self._stream_ctx = None
+
     def call_ai(self):
         if self.backend == "direct":
             self.call_direct_api()
@@ -3402,7 +4351,8 @@ class LinexinAISysadminWidget(Gtk.Box):
 
         data = {
             "model": self.model,
-            "messages": self.chat_history
+            "messages": self.chat_history,
+            "stream": True
         }
         req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers={
             "Content-Type": "application/json",
@@ -3435,7 +4385,8 @@ class LinexinAISysadminWidget(Gtk.Box):
 
         data = {
             "model": self.endpoint_model or "local-model",
-            "messages": self.chat_history
+            "messages": self.chat_history,
+            "stream": True
         }
         req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers={
             "Content-Type": "application/json"
@@ -3527,7 +4478,7 @@ class LinexinAISysadminWidget(Gtk.Box):
         data = {
             "model": self.local_model,
             "messages": ollama_messages,
-            "stream": False
+            "stream": True
         }
         req = urllib.request.Request(self.local_url, data=json.dumps(data).encode('utf-8'), headers={
             "Content-Type": "application/json"
@@ -3536,40 +4487,113 @@ class LinexinAISysadminWidget(Gtk.Box):
         self._execute_urllib_request(req, is_ollama=True)
 
     def _execute_urllib_request(self, req, is_ollama=False):
+        import re
         try:
             # A generous timeout acts as a safety net against an unresponsive
             # server hanging the worker thread forever, while still allowing
             # slow local models enough time to generate a full response.
             with urllib.request.urlopen(req, timeout=600) as response:
-                result = json.loads(response.read().decode('utf-8'))
-                if is_ollama:
-                    reply = result.get('message', {}).get('content', '')
+                ctype = (response.headers.get('Content-Type') or '').lower()
+                is_sse = 'text/event-stream' in ctype
+
+                # Create the streaming bubble (replaces the Thinking... indicator).
+                GLib.idle_add(self._stream_begin)
+
+                content_accum = ""
+                reasoning_accum = ""
+
+                if is_sse:
+                    # OpenAI-compatible Server-Sent Events stream.
+                    for raw in response:
+                        if getattr(self, 'abort_processing', False):
+                            break
+                        line = raw.decode('utf-8', 'replace').strip()
+                        if not line or not line.startswith('data:'):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == '[DONE]':
+                            break
+                        try:
+                            obj = json.loads(payload)
+                        except Exception:
+                            continue
+                        choices = obj.get('choices') or []
+                        if not choices:
+                            continue
+                        delta = choices[0].get('delta') or {}
+                        c = delta.get('content') or ''
+                        r = delta.get('reasoning_content') or delta.get('reasoning') or ''
+                        if c or r:
+                            content_accum += c
+                            reasoning_accum += r
+                            GLib.idle_add(self._stream_push, c, r)
+                elif is_ollama:
+                    # Ollama streams newline-delimited JSON objects.
+                    for raw in response:
+                        if getattr(self, 'abort_processing', False):
+                            break
+                        line = raw.decode('utf-8', 'replace').strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except Exception:
+                            continue
+                        if obj.get('error'):
+                            GLib.idle_add(self._stream_discard)
+                            GLib.idle_add(self.on_api_error, str(obj.get('error')))
+                            return
+                        msg = obj.get('message') or {}
+                        c = msg.get('content') or ''
+                        r = msg.get('thinking') or ''
+                        if c or r:
+                            content_accum += c
+                            reasoning_accum += r
+                            GLib.idle_add(self._stream_push, c, r)
+                        if obj.get('done'):
+                            break
                 else:
+                    # Non-streaming fallback: the server returned a single JSON
+                    # document despite the stream request. Parse it whole and
+                    # feed it through the same animated path for consistency.
+                    result = json.loads(response.read().decode('utf-8'))
                     try:
-                        reply = result['choices'][0]['message']['content']
+                        message = result['choices'][0]['message']
+                        content_accum = message.get('content') or ''
+                        reasoning_accum = message.get('reasoning_content') or message.get('reasoning') or ''
                     except (KeyError, IndexError, TypeError):
-                        # Surface server-side error payloads (common with local
-                        # OpenAI-compatible endpoints) instead of a cryptic crash.
                         err = result.get('error') if isinstance(result, dict) else None
                         if isinstance(err, dict):
                             err = err.get('message', err)
+                        GLib.idle_add(self._stream_discard)
                         GLib.idle_add(self.on_api_error, _("Unexpected response from server: {}").format(err or result))
                         return
-                
-                # Trim surrounding whitespace/newlines: some models (notably
-                # local OpenAI-compatible servers) prefix replies with blank
-                # lines, which would otherwise push the text down in the bubble.
-                reply = (reply or "").strip()
+                    if content_accum or reasoning_accum:
+                        GLib.idle_add(self._stream_push, content_accum, reasoning_accum)
 
-                self.chat_history.append({"role": "assistant", "content": reply})
-                
-                # Check for autonomous command execution securely via helper method
-                if self._run_autonomous_commands(reply, is_ollama):
+                if getattr(self, 'abort_processing', False):
+                    GLib.idle_add(self._stream_discard)
                     return
 
-                else:
-                    if getattr(self, 'abort_processing', False): return
-                    GLib.idle_add(self.on_api_success, reply)
+                # The visible reply is the content with any inline <think>
+                # blocks removed (those are shown in the reasoning section).
+                reply = re.sub(r'<think>.*?</think>', '', content_accum, flags=re.DOTALL).strip()
+
+                self.chat_history.append({"role": "assistant", "content": reply})
+
+                # Autonomous command execution: if the reply contains shell
+                # blocks, finalize this bubble (without unlocking input) and let
+                # the helper execute the commands and re-fire the API.
+                has_cmd = bool(re.findall(r'```(?:bash|sh)\n.*?```', reply, re.DOTALL))
+                if has_cmd:
+                    GLib.idle_add(self._stream_finish, reply, False, False)
+                    if self._run_autonomous_commands(reply, is_ollama):
+                        return
+
+                if getattr(self, 'abort_processing', False):
+                    return
+                speak = getattr(self, '_speak_next_response', False)
+                GLib.idle_add(self._stream_finish, reply, speak, True)
                     
         except urllib.error.HTTPError as e:
             try:
@@ -3585,18 +4609,22 @@ class LinexinAISysadminWidget(Gtk.Box):
                     else:
                         GLib.idle_add(self.on_api_error, _("Model download was cancelled or failed."))
 
+                GLib.idle_add(self._stream_discard)
                 GLib.idle_add(self.add_message_bubble, "assistant", _("Model '{}' not found locally. Downloading now...").format(self.local_model))
                 GLib.idle_add(lambda: self.on_pull_ollama_clicked(self.local_model, after_pull))
                 return
                 
+            GLib.idle_add(self._stream_discard)
             GLib.idle_add(self.on_api_error, msg)
         except urllib.error.URLError as e:
             msg = f"Connection Failed: {str(e)}"
             if is_ollama:
                 msg += "\nIs the ollama.service running? Try: `systemctl enable --now ollama`"
+            GLib.idle_add(self._stream_discard)
             GLib.idle_add(self.on_api_error, msg)
         except Exception as e:
             msg = f"Error: {str(e)}"
+            GLib.idle_add(self._stream_discard)
             GLib.idle_add(self.on_api_error, msg)
 
     def _run_autonomous_commands(self, reply, is_ollama):
