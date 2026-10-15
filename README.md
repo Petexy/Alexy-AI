@@ -1,9 +1,16 @@
 # Alexy AI Agent
+
 <p align="center">
-  <img src="https://i.ibb.co/LhDFZvfh/Alexy.png" alt="LinexinCenter" with="200" height="200"/>
+  <img src="https://i.ibb.co/LhDFZvfh/Alexy.png" alt="Alexy AI" width="200" height="200"/>
 </p>
 
-Alexy AI Agent is the conversational assistant and voice interface implemented by the Alexy widget and the hey-linux wake-word daemon.
+**Alexy AI Agent** is the conversational assistant and voice interface of
+Linexin: the Alexy widget for [Linexin Center](https://github.com/Petexy/Linexin-Center)
+and the `hey-linux` wake-word daemon.
+
+This version of the widget is a rewrite in **Rust** (GTK4 + Libadwaita) and a
+drop-in replacement for the Python one: same package, same settings, same saved
+conversations, same look.
 
 The app requires `Linexin Center` to be installed.
 
@@ -11,125 +18,94 @@ The app requires `Linexin Center` to be installed.
 
 ### `Alexy AI`
 
-This is the main Alexy AI Agent UI and runtime. It provides:
+The main Alexy AI Agent UI. It provides:
 
-- Chat-based assistant UI built with GTK4 and libadwaita.
-- Multiple LLM backends:
-  - Direct API mode.
-  - Qwen CLI wrapper mode.
-  - Local Ollama mode.
-- Voice input with two speech-to-text engines:
-  - Whisper.
-  - Vosk.
+- A chat-based assistant with replies streaming in, formatted as Markdown, with
+  the model's reasoning in its own section.
+- Three LLM backends:
+  - An online, OpenAI-compatible API.
+  - Local Ollama.
+  - A local OpenAI-compatible endpoint (its model is detected).
+- Voice input with two speech-to-text engines: Whisper and Vosk.
 - Optional voice correction for speech transcripts.
-- Text-to-speech playback for spoken responses.
-- Conversation persistence and history browsing.
-- Image input support for multimodal prompts.
-- Theme support for icons, avatars, and CSS styling.
-- Autonomous command execution support, including guarded privileged execution through the widget's sudo manager.
+- Spoken replies (Piper, with `espeak-ng` for languages Piper has no voice
+  for).
+- Saved conversations, grouped by agent, to load, rename and delete.
+- Agents of your own, each with its own prompt.
+- Image input for multimodal prompts (pasted, dropped or attached) and Screen
+  Awareness (a screenshot sent with your question).
+- Autonomous command execution for sysadmin-style tasks, on its own or after
+  asking you; privileged commands ask for your password first.
+- Themes for the chat: default, iMessage, Matrix, and your own.
 
-The widget also exposes a compact voice window mode used by wake-word activation. In compact mode, Alexy opens as a small floating voice bar with controls for microphone, settings, close, and expanding back into the full chat UI.
+The widget also has a compact voice window used by wake-word activation: a
+small floating voice bar with the microphone, settings, close, and a button
+that expands it into the full chat.
 
 ### `hey-linux` daemon
 
-This is the wake-word listener daemon for Alexy AI Agent. It provides:
+The wake-word listener for Alexy AI Agent. It provides:
 
 - Continuous microphone listening using `openWakeWord`.
-- Automatic first-run bootstrap into a dedicated virtual environment.
-- Loading of custom wake-word models from `/usr/share/linexin/wakewordmodels/`.
-- Launching Alexy directly into compact voice mode after detection.
-- Re-trigger behavior that reactivates the existing compact instance instead of opening duplicates.
+- Automatic first-run setup of its own virtual environment.
+- Custom wake-word models from `/usr/share/linexin/wakewordmodels/` ("Hey
+  Alexy" is included).
+- Launching Alexy directly into its compact voice window after detection, or
+  reactivating the one already open instead of opening a duplicate.
 - Desktop notifications for activation events.
-
-By default, it listens for a configured wake word and then launches Alexy with voice input already active.
 
 ## How Alexy Works
 
-Alexy AI Agent is split into two runtime paths:
-
-1. `hey-linux` listens for a wake word in the background.
-2. When triggered, it launches Alexy in compact voice mode using:
+1. `hey-linux` listens for the wake word in the background (turn it on with
+   the "Hey Alexy" switch in Alexy's settings).
+2. When triggered, it launches Alexy in compact voice mode:
 
 ```bash
 linexin-center -w aa-alexy-ai-widget --voice --compact
 ```
 
-3. The compact window can:
-   - start speech recognition,
-   - show model-loading, listening, transcribing, and thinking states,
-   - display the assistant reply,
-   - open settings,
-   - expand into the full Alexy chat window.
+3. The compact window listens, shows when it is loading, listening,
+   transcribing and thinking, displays the reply (and reads it aloud), and can
+   open the settings or expand into the full chat.
 
-The full widget can also be used directly as the main interactive UI for text chat, voice chat, backend selection, model management, and conversation history.
+The full widget is also the main interactive UI for text chat, voice chat,
+backend selection, model management and conversation history.
 
-## Features
-
-### LLM backends
-
-- Direct API mode for OpenAI-compatible endpoints.
-- Qwen CLI integration with OAuth-based authentication.
-- Local Ollama integration for offline or self-hosted usage.
-
-### Voice stack
-
-- Whisper for higher-quality offline speech recognition.
-- Vosk for lightweight streaming recognition.
-- Wake-word activation through `hey-linux` and `openWakeWord`.
-- Text-to-speech output using Piper where available, with `espeak-ng` fallback for unsupported voices.
-
-### UX features
-
-- Full chat interface and compact voice interface.
-- Persistent saved conversations stored under the user config directory.
-- Themeable assets and CSS.
-- Optional image attachments for multimodal prompts.
-- Automatic command execution flow for sysadmin-style tasks.
+On a LineXinBar desktop Alexy is a controller-friendly page with the same
+chat, voice, conversations and settings; there the voice command above opens
+it listening at once.
 
 ## File Locations
 
-- Main widget:
-  - `src/usr/share/linexin/widgets/aa-alexy-ai-widget.py`
-- Wake-word daemon:
-  - `src/usr/bin/hey-linux`
-- Shared Alexy config:
-  - `~/.config/linexin-center/ai-sysadmin.json`
-- Saved conversations:
-  - `~/.config/linexin-center/conversations/`
-- User themes:
-  - `~/.config/linexin-center/themes/`
-- Wake-word models:
-  - `/usr/share/linexin/wakewordmodels/`
-- hey-linux virtual environment:
-  - `~/.local/share/linexin/hey-linux-venv`
+- Alexy's settings: `~/.config/linexin/ai-sysadmin.json`
+- Saved conversations: `~/.config/linexin/conversations/`
+- Your own themes: `~/.config/linexin/themes/`
+- Wake-word models: `/usr/share/linexin/wakewordmodels/`
+- hey-linux virtual environment: `~/.local/share/linexin/hey-linux-venv`
+
+Settings and conversations from older versions (`~/.config/linexin-center/`)
+are moved there automatically.
 
 ## Runtime Requirements
 
-Alexy AI Agent depends on a Linux desktop environment with the following available at runtime:
+The package pulls in:
 
-- Python 3
-- GTK4 and libadwaita Python bindings
-- `arecord`
-- `notify-send`
-- `bash`
+- Linexin Center 4.0 or newer
+- GTK 4 and Libadwaita
+- Python 3 with `python-openai-whisper` and `python-pyaudio`
+- `alsa-utils` (`arecord`)
 
-Depending on which features are enabled, Alexy may also use:
+Depending on which features you use, Alexy may also use:
 
-- `ollama`
-- `qwen` or `qwen-code`
-- `paplay`
-- `aplay`
-- `espeak-ng`
-- `curl`
-- `unzip`
-
-The wake-word daemon bootstraps `openWakeWord` for itself on first run by creating its own virtual environment.
+- `ollama` (Alexy can install and remove it for you)
+- `python-vosk` (Alexy can install it for you)
+- Piper or `espeak-ng`, and `paplay`, for spoken replies
+- A screenshot tool for Screen Awareness (`grim`, `spectacle`,
+  `gnome-screenshot` or `scrot`)
 
 ## Running Alexy
 
 ### Full widget
-
-Alexy can be launched through the Linexin widget host with the Alexy widget ID:
 
 ```bash
 linexin-center -w aa-alexy-ai-widget
@@ -137,62 +113,62 @@ linexin-center -w aa-alexy-ai-widget
 
 ### Compact voice mode
 
-To open Alexy directly in compact voice mode:
-
 ```bash
 linexin-center -w aa-alexy-ai-widget --voice --compact
 ```
 
 ### Wake-word daemon
 
-To run the wake-word listener:
-
 ```bash
 hey-linux
 ```
 
-On first launch, `hey-linux` creates its private virtual environment and installs `openwakeword` automatically.
+On first launch, `hey-linux` creates its private virtual environment and
+installs `openwakeword` automatically.
 
 ## Configuration Notes
 
-Alexy stores its settings in `~/.config/linexin-center/ai-sysadmin.json`. The widget manages settings for:
+Alexy's settings page manages:
 
-- Selected LLM backend.
-- API endpoint and API key for direct mode.
-- Selected Ollama model.
-- Selected STT engine and model.
-- Wake-word integration toggle.
-- Voice correction toggles.
-- Theme selection.
-- Command auto-execution behavior.
+- The LLM backend, the online API's address, key and model, and the local
+  endpoint.
+- Ollama's models (pulled and removed from Alexy).
+- Your agents and their prompts.
+- The speech-to-text engine, Whisper's model and Vosk's language.
+- The "Hey Alexy" wake word and voice correction.
+- The theme.
+- Whether commands run on their own or after asking.
 
-The wake-word daemon reads the shared config file for its detection threshold and model behavior.
+The wake-word daemon reads its detection threshold (`wakeword_threshold`) from
+the same file.
 
-## Wake-Word Models
-
-`hey-linux` loads custom wake-word models from:
-
-```text
-/usr/share/linexin/wakewordmodels/
-```
-
-Supported model file types:
-
-- `.onnx`
-- `.tflite`
-
-If no custom models are present, `hey-linux` falls back to the built-in `openWakeWord` models.
-
-## Scope
-
-This repository may contain packaging, debug artifacts and training scripts This document is only for the Alexy AI Agent itself:
-
-- the Alexy widget in `aa-alexy-ai-widget.py`
-- the wake-word daemon in `hey-linux`
 
 ## Screenshots
 <p align="center">
-  <img src="https://i.ibb.co/27SGp8Fg/alexy-1.png" alt="LinexinCenter" width="800"/> <br/><br/>
-  <img src="https://i.ibb.co/S4SYjrX5/alexy-3.png" alt="LinexinCenter" width="800"/> <br/><br/>
-  <img src="https://i.ibb.co/ZR18LFKz/alexy-2.png" alt="LinexinCenter" width="800"/> <br/><br/>
+  <img src="https://i.ibb.co/27SGp8Fg/alexy-1.png" alt="Alexy AI" width="800"/> <br/><br/>
+  <img src="https://i.ibb.co/S4SYjrX5/alexy-3.png" alt="Alexy AI" width="800"/> <br/><br/>
+  <img src="https://i.ibb.co/ZR18LFKz/alexy-2.png" alt="Alexy AI" width="800"/> <br/><br/>
 </p>
+
+## 🔧 Building from Source
+
+```bash
+cargo build --release --lib
+makepkg -si
+```
+
+Cargo fetches Linexin Center's crates from its repository while building.
+Tests, how to build against a local Linexin Center checkout and how the widget
+works inside are described in [DEVELOPMENT.md](DEVELOPMENT.md).
+
+## Licence
+
+Copyright (C) 2026 Petexy
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. It is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License in `LICENSE` for more
+details.

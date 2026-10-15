@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""
+hey-linux — Wake word listener daemon for Linexin AI Sysadmin.
+
+Uses openWakeWord for lightweight wake word detection, then
+launches the AI Sysadmin widget with voice-to-text active.
+
+Usage:
+    hey-linux
+"""
+
+import os
+import sys
+import json
+import signal
+import subprocess
+import shutil
+import time
+import argparse
+import venv
+
+# Alexy keeps its settings in ~/.config/linexin; before Alexy has run once and
+# moved them there, they are still in ~/.config/linexin-center.
+CONFIG_DIR = os.path.expanduser("~/.config/linexin")
+OLD_CONFIG_DIR = os.path.expanduser("~/.config/linexin-center")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "ai-sysadmin.json")
+OLD_CONFIG_FILE = os.path.join(OLD_CONFIG_DIR, "ai-sysadmin.json")
+MODEL_DIR = "/usr/share/linexin/wakewordmodels/"
+VENV_DIR = os.path.expanduser("~/.local/share/linexin/hey-linux-venv")
+
+LINEXIN_CENTER = "linexin-center"
+
+SAMPLE_RATE = 16000
+CHUNK_SAMPLES = 1280
+CHUNK_BYTES = CHUNK_SAMPLES * 2
+DEFAULT_THRESHOLD = 0.5
+
+
+def _venv_python():
+    """Return the path to the venv's Python interpreter."""
+    return os.path.join(VENV_DIR, "bin", "python")
+
+
+def _is_running_in_venv():
+    """Check if we're already running inside our venv."""
+    return os.path.realpath(sys.executable).startswith(os.path.realpath(VENV_DIR))
+
+
+def ensure_venv():
+    """Create the venv and install openwakeword if needed, then re-exec into it."""
+    if _is_running_in_venv():
+        return  # Already in venv, nothing to do
+
+    venv_py = _venv_python()
+
+    if not os.path.isfile(venv_py):
+        print("[hey-linux] First run — creating virtual environment...")
+        venv.create(VENV_DIR, with_pip=True, system_site_packages=False)
+        print(f"[hey-linux] Venv created at {VENV_DIR}")
+        print("[hey-linux] Installing openwakeword (this may take a moment)...")
+        subprocess.check_call(
+            [venv_py, "-m", "pip", "install", "--quiet", "openwakeword"],
+        )
+        print("[hey-linux] openwakeword installed successfully.")
+
+    # Re-exec this script using the venv Python so all imports resolve from it
+    os.execv(venv_py, [venv_py] + [os.path.abspath(__file__)] + sys.argv[1:])
+
+
+def load_config():
+    """Load settings from the shared config file."""
+    config = {
+        "wakeword_threshold": DEFAULT_THRESHOLD,
+    }
+    config_file = CONFIG_FILE if os.path.exists(CONFIG_FILE) else OLD_CONFIG_FILE
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, "r") as f:
+                saved = json.load(f)
+            if "wakeword_threshold" in saved:
+                config["wakeword_threshold"] = float(saved["wakeword_threshold"])
+        except Exception as e:
+            print(f"[hey-linux] Warning: Could not read config: {e}")
+    return config
+
+
+def find_wakeword_models():
+    """Find wake word model files in the model directory."""
+    models = []
+    if os.path.isdir(MODEL_DIR):
+        for f in sorted(os.listdir(MODEL_DIR)):
+            if f.endswith((".onnx", ".tflite")):
+                models.append(os.path.join(MODEL_DIR, f))
+    return models
+
+
+def listen_for_wake_word(oww_model, threshold):
+    """Listen for wake word using openWakeWord. Blocks until detected.
+    
+    Returns True as soon as the wake word is detected so the caller can
+    launch the assistant immediately.
+    """
+    import numpy as np  # type: ignore
+
+    proc = subprocess.Popen(
+        ["arecord", "-f", "S16_LE", "-c", "1", "-r", str(SAMPLE_RATE), "-q"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+
+    try:
+        while True:
+            if proc.poll() is not None:
+                break
+            stdout = proc.stdout
+            if stdout is None:
+                break
+            data = stdout.read(CHUNK_BYTES)
+            if not data or len(data) < CHUNK_BYTES:
+                break
+
+            audio = np.frombuffer(data, dtype=np.int16)
+            oww_model.predict(audio)
+
+            for model_name in oww_model.prediction_buffer.keys():
+                scores = list(oww_model.prediction_buffer[model_name])
+                if scores and scores[-1] > threshold:
+                    print(f'[hey-linux] Wake word detected: "{model_name}" (score: {scores[-1]:.3f})')
+                    return True
+    finally:
+        proc.terminate()
+        proc.wait()
+
+    return False
+
+
+def debounce_wake_word(oww_model, threshold):
+    """Read audio until wake word scores drop, preventing re-triggers."""
+    import numpy as np  # type: ignore
+
+    proc = subprocess.Popen(
+        ["arecord", "-f", "S16_LE", "-c", "1", "-r", str(SAMPLE_RATE), "-q"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+
+    try:
+        while True:
+            if proc.poll() is not None:
+                break
+            stdout = proc.stdout
+            if stdout is None:
+                break
+            data = stdout.read(CHUNK_BYTES)
+            if not data or len(data) < CHUNK_BYTES:
+                break
+
+            audio = np.frombuffer(data, dtype=np.int16)
+            oww_model.predict(audio)
+
+            max_score = 0.0
+            for model_name in oww_model.prediction_buffer.keys():
+                scores = list(oww_model.prediction_buffer[model_name])
+                if scores:
+                    max_score = max(max_score, scores[-1])
+
+            if max_score < threshold * 0.3:
+                oww_model.reset()
+                return
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def send_notification(title, body):
+    """Send a desktop notification."""
+    try:
+        subprocess.Popen(
+            ["notify-send", "--app-name=Hey Linux", "-i", "audio-input-microphone-symbolic", title, body],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def launch_widget():
+    """Launch linexin-center asynchronously. Returns the Popen object."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        shutil.which(LINEXIN_CENTER),
+        os.path.join(script_dir, LINEXIN_CENTER),
+    ]
+
+    cmd = None
+    for c in candidates:
+        if c and os.path.isfile(c):
+            cmd = c
+            break
+
+    if cmd is None:
+        print(f"[hey-linux] Error: Could not find {LINEXIN_CENTER}")
+        return None
+
+    env = os.environ.copy()
+    env["LINEXIN_NEW_INSTANCE"] = "1"
+
+    print(f"[hey-linux] Launching: {cmd} -w aa-alexy-ai-widget --voice --compact")
+    return subprocess.Popen(
+        [cmd, "-w", "aa-alexy-ai-widget", "--voice", "--compact"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=env
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Hey Linux — Wake word listener for Linexin AI Sysadmin'
+    )
+    parser.parse_args()
+
+    # Bootstrap: create venv + install openwakeword on first run, then re-exec
+    ensure_venv()
+
+    from openwakeword.model import Model as OWWModel  # type: ignore
+
+    config = load_config()
+    threshold = config["wakeword_threshold"]
+
+    running = True
+
+    def signal_handler(sig, frame):
+        nonlocal running
+        print("\n[hey-linux] Shutting down...")
+        running = False
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    print("[hey-linux] Starting wake word listener (backend: openWakeWord)")
+    print('[hey-linux] Say "Hey Linux" to activate the AI assistant.')
+
+    custom_models = find_wakeword_models()
+    if custom_models:
+        print(f"[hey-linux] Loading custom model(s): {[os.path.basename(m) for m in custom_models]}")
+        oww_model = OWWModel(wakeword_model_paths=custom_models)
+    else:
+        print(f"[hey-linux] No custom models in {MODEL_DIR}, using built-in openWakeWord models.")
+        print("[hey-linux] Place .onnx/.tflite wake word models in that directory for custom wake words.")
+        oww_model = OWWModel()
+
+    model_names = list(oww_model.prediction_buffer.keys())
+    print(f"[hey-linux] Active models: {model_names}")
+    print(f"[hey-linux] Detection threshold: {threshold}")
+    print("[hey-linux] Listening for wake word...")
+
+    launched_proc = None
+
+    while running:
+        try:
+            if listen_for_wake_word(oww_model, threshold):
+                # Only launch if the previously launched instance is no longer running
+                if launched_proc is not None and launched_proc.poll() is None:
+                    # App is already running — send SIGUSR1 to reactivate voice input
+                    try:
+                        os.kill(launched_proc.pid, signal.SIGUSR1)
+                        print("[hey-linux] Sent SIGUSR1 to reactivate voice input.")
+                        send_notification("Hey Alexy", "Reactivating voice input...")
+                    except OSError as e:
+                        print(f"[hey-linux] Failed to signal running instance: {e}")
+                else:
+                    send_notification("Hey Alexy", "Activating AI assistant...")
+                    launched_proc = launch_widget()
+
+                # Debounce: wait for scores to drop so the same
+                # utterance doesn't trigger a second detection
+                debounce_wake_word(oww_model, threshold)
+
+                if running:
+                    print("[hey-linux] Resuming listening...")
+        except Exception as e:
+            print(f"[hey-linux] Error: {e}")
+            time.sleep(1)
+
+    print("[hey-linux] Stopped.")
+
+
+if __name__ == "__main__":
+    main()
